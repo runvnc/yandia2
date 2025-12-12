@@ -78,28 +78,26 @@ def build_runtime(
 ) -> tuple[RuntimeContext, str, str]:
     device_obj = torch.device(device)
     if device_obj.type == "cuda":
+        # Enable TF32 for matmul (faster on Ampere+)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Please use the new API settings",
+            )
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        # Try newer API if available
         cuda_matmul = torch.backends.cuda.matmul
-        cudnn_conv = torch.backends.cudnn.conv
         if hasattr(cuda_matmul, "fp32_precision"):
             cuda_matmul.fp32_precision = "tf32"
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Please use the new API settings",
-                )
-                torch.backends.cuda.matmul.allow_tf32 = True
-        else:  # pragma: no cover - compatibility with older PyTorch
-            torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(cudnn_conv, "fp32_precision"):
-            cudnn_conv.fp32_precision = "tf32"
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Please use the new API settings",
-                )
-                torch.backends.cudnn.allow_tf32 = True
-        else:  # pragma: no cover
-            torch.backends.cudnn.allow_tf32 = True
+        
+        # Handle cudnn conv TF32 - only if attribute exists (newer PyTorch)
+        if hasattr(torch.backends.cudnn, "conv"):
+            cudnn_conv = torch.backends.cudnn.conv
+            if hasattr(cudnn_conv, "fp32_precision"):
+                cudnn_conv.fp32_precision = "tf32"
+    
     precision = resolve_precision(dtype_pref, device_obj)
     config = load_config(config_path)
     model = Dia2Model(config, precision, device=device_obj)
