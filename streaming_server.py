@@ -59,9 +59,6 @@ MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
 
-# Streaming config
-CHUNK_FRAMES = 3  # Decode every N frames (~125ms at 12.5ms/frame)
-UNDELAY_FRAMES = 8  # First N frames don't produce valid audio due to codec delay
 
 # Global model instance
 dia: Optional[Dia2] = None
@@ -282,6 +279,9 @@ async def run_streaming_generation(
     This is the core streaming logic - it runs the generation loop and yields
     audio chunks incrementally instead of waiting for full generation.
     """
+    # Streaming config
+    CHUNK_FRAMES = 6  # Decode every N frames after undelaying
+    
     token_ids = runtime.constants
     
     # Build entries from prefix + new text
@@ -314,6 +314,10 @@ async def run_streaming_generation(
     # The HuggingFace MimiModel doesn't have decode_streaming, but chunk-by-chunk
     # decoding works fine since Mimi's decoder is relatively frame-independent
     
+    # Get delay info for proper undelaying
+    delays = runtime.audio_delays  # List of delays per codebook
+    max_delay = int(runtime.audio_delay_tensor.max().item()) if runtime.audio_delay_tensor.numel() else 0
+    
     # Setup tensors for generation loop
     step_tokens = gen_state.step_tokens
     audio_buf = gen_state.audio_buf
@@ -335,29 +339,25 @@ async def run_streaming_generation(
         transformer_capture = None
         dep_captures = None
     
-    delay_tensor = runtime.audio_delay_tensor
-    max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
     
     use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     
+    delay_tensor = runtime.audio_delay_tensor
     positions_view = positions.expand(branches, -1)
     
     # Streaming state
-    last_decode_pos = start_step
+    first_word_frame: Optional[int] = None  # When first new_word token appears (start of actual content)
+    decode_pos = 0  # Next position to decode (in undelayed space)
     eos_cutoff = None
-    samples_generated = 0
-    
-    # Calculate samples to skip (undelay frames that don't have valid audio)
-    samples_per_frame = runtime.mimi.samples_per_frame
-    undelay_samples = UNDELAY_FRAMES * samples_per_frame
-    samples_skipped = 0
+    total_samples = 0
     
     print(f"[Stream] Starting generation loop from step {start_step}...")
     gen_start = time.time()
     first_chunk_sent = False
+    last_step = start_step - 1
     
     with torch.inference_mode():
         for offset in range(max_context):
@@ -411,6 +411,11 @@ async def run_streaming_generation(
             # State machine
             main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
             second_token = aux_token if aux_token != -1 else token_ids.pad
+            
+            # Track first word frame (marks start of actual generated content)
+            if first_word_frame is None and main_token == token_ids.new_word:
+                first_word_frame = t - config.initial_padding
+            
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = second_token
             
@@ -469,61 +474,72 @@ async def run_streaming_generation(
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
             
-            # Decode and yield audio chunks
-            current_pos = t + 2  # +2 because we just wrote to t+1
-            frames_to_decode = current_pos - last_decode_pos
+            last_step = t
+            generation_pos = t + 1  # We just wrote to position t+1
             
-            if frames_to_decode >= CHUNK_FRAMES:
-                # Get tokens to decode
-                chunk_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
-                chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
+            # Decode and yield audio chunks
+            # We can safely undelay position p if we have data up to p + max_delay
+            # So we can decode up to: generation_pos - max_delay
+            if first_word_frame is not None:
+                # Start decoding from first_word_frame
+                if decode_pos < first_word_frame:
+                    decode_pos = first_word_frame
                 
-                # Decode chunk (using regular decode, not streaming)
-                pcm = runtime.mimi.decode(chunk_tokens)
-                waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
+                decodable_end = generation_pos - max_delay
+                frames_to_decode = decodable_end - decode_pos
                 
-                if waveform.shape[0] > 0:
-                    # Skip initial samples if needed (undelay artifacts)
-                    if samples_skipped < undelay_samples:
-                        to_skip = min(waveform.shape[0], undelay_samples - samples_skipped)
-                        waveform = waveform[to_skip:]
-                        samples_skipped += to_skip
+                if frames_to_decode >= CHUNK_FRAMES:
+                    # Extract and undelay the frames
+                    num_codebooks = len(delays)
+                    chunk_tokens = torch.zeros(1, num_codebooks, frames_to_decode, dtype=torch.long, device=runtime.device)
+                    
+                    for cb in range(num_codebooks):
+                        d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
+                        chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
+                    
+                    chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
+                    
+                    # Decode chunk
+                    pcm = runtime.mimi.decode(chunk_tokens)
+                    waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
                     
                     if waveform.shape[0] > 0:
-                        # Convert to 16-bit PCM bytes
                         pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-                        samples_generated += waveform.shape[0]
+                        total_samples += waveform.shape[0]
                         
                         if not first_chunk_sent:
                             first_chunk_sent = True
-                            elapsed = time.time() - gen_start
-                            print(f"[Stream] First chunk sent after {elapsed:.2f}s")
+                            print(f"[Stream] First chunk sent after {time.time() - gen_start:.2f}s")
                         
                         yield (pcm16, False)
-                
-                last_decode_pos = current_pos
+                    
+                    decode_pos = decodable_end
                 
                 # Yield to event loop
                 await asyncio.sleep(0)
     
     # Flush remaining frames
-    final_pos = min(t + 2, audio_buf.shape[-1])
-    if final_pos > last_decode_pos:
-        chunk_tokens = audio_buf[0:1, :, last_decode_pos:final_pos].clone()
-        chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
+    if first_word_frame is not None:
+        generation_pos = last_step + 2
+        decodable_end = min(generation_pos - max_delay, audio_buf.shape[-1] - max_delay)
         
-        pcm = runtime.mimi.decode(chunk_tokens)
-        waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
-        
-        if waveform.shape[0] > 0:
-            if samples_skipped < undelay_samples:
-                to_skip = min(waveform.shape[0], undelay_samples - samples_skipped)
-                waveform = waveform[to_skip:]
-                samples_skipped += to_skip
+        if decodable_end > decode_pos:
+            num_codebooks = len(delays)
+            remaining_frames = decodable_end - decode_pos
+            chunk_tokens = torch.zeros(1, num_codebooks, remaining_frames, dtype=torch.long, device=runtime.device)
+            
+            for cb in range(num_codebooks):  
+                d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
+                chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
+            
+            chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
+            
+            pcm = runtime.mimi.decode(chunk_tokens)
+            waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
             
             if waveform.shape[0] > 0:
                 pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-                samples_generated += waveform.shape[0]
+                total_samples += waveform.shape[0]
                 yield (pcm16, True)
     
     # Update graph cache
@@ -532,7 +548,7 @@ async def run_streaming_generation(
         graph_cache.dep_captures = dep_captures
     
     total_time = time.time() - gen_start
-    duration = samples_generated / runtime.mimi.sample_rate
+    duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
     print(f"[Stream] Generation complete: {duration:.2f}s audio in {total_time:.2f}s (RTF: {total_time/max(duration, 0.01):.2f})")
 
 
