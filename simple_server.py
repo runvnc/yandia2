@@ -135,7 +135,7 @@ async def text_to_speech(
     text: str = Form(...),
     speaker_1: Optional[str] = Form(None),
     speaker_2: Optional[str] = Form(None),
-    cfg_scale: float = Form(2.0),
+    cfg_scale: float = Form(1.0),
     temperature: float = Form(0.8),
     top_k: int = Form(50),
     use_cuda_graph: bool = Form(True),
@@ -208,7 +208,7 @@ async def text_to_speech_file(
     text: str = Form(...),
     speaker_1: Optional[str] = Form(None),
     speaker_2: Optional[str] = Form(None),
-    cfg_scale: float = Form(2.0),
+    cfg_scale: float = Form(1.0),
     temperature: float = Form(0.8),
     output_name: str = Form("output"),
 ):

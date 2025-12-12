@@ -257,7 +257,7 @@ async def user_spoke(file: UploadFile = File(...)):
 @app.post("/generate")
 async def generate(
     text: str = Form(...),
-    cfg_scale: float = Form(2.0),
+    cfg_scale: float = Form(1.0),
     temperature: float = Form(0.8),
     top_k: int = Form(50),
 ):
