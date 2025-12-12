@@ -310,7 +310,7 @@ async def run_generation_with_original_loop(
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
         print(f"[DiagLoop] Warmup done, start_step={start_step}")
     
-    logger = RuntimeLogger(verbose=True)
+    logger = RuntimeLogger(True)  # verbose=True as positional arg
     
     # Use the ORIGINAL run_generation_loop from generator.py
     print(f"[DiagLoop] Running ORIGINAL generation loop...")
