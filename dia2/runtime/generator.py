@@ -36,10 +36,13 @@ class GenerationState:
     audio_buf: torch.Tensor
 
     def trim_audio(self, limit: int, pad_token: int, ungenerated: int) -> torch.Tensor:
+        """Return trimmed audio buffer WITHOUT modifying self.audio_buf.
+        
+        This is important for CUDA graph caching - we must not replace the tensor.
+        """
         trimmed = self.audio_buf[:, :, :limit]
         pad = torch.full_like(trimmed, pad_token)
         trimmed = torch.where(trimmed == ungenerated, pad, trimmed)
-        self.audio_buf = trimmed
         return trimmed
 
     @property
