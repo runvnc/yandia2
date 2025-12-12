@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """Test client for the streaming Dia2 server.
 
 Usage:
@@ -7,6 +8,11 @@ Usage:
 Examples:
     python test_streaming.py "Hello, this is a test of streaming TTS."
     python test_streaming.py  # Uses default text
+
+Environment variables:
+    SERVER_URL - HTTP server URL (default: http://localhost:8000)
+    WS_URL - WebSocket URL (default: ws://localhost:8000/ws/generate)
+    VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
 """
 import asyncio
 import json
@@ -29,8 +35,11 @@ except ImportError:
     sys.exit(1)
 
 
-SERVER_URL = "http://localhost:8000"
-WS_URL = "ws://localhost:8000/ws/generate"
+# Configurable URLs via environment variables
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
+WS_URL = os.environ.get("WS_URL", "ws://localhost:8000/ws/generate")
+VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
+
 
 
 async def setup_voice(server_url: str, voice_file: str):
@@ -143,7 +152,7 @@ async def main():
     
     # Setup voice if not initialized
     if not health.get("conversation", {}).get("initialized"):
-        voice_file = Path(__file__).parent / "example_prefix1.wav"
+        voice_file = Path(__file__).parent / VOICE_FILE
         if not voice_file.exists():
             print(f"Voice file not found: {voice_file}")
             print("Please provide a voice warmup file.")

@@ -1,19 +1,23 @@
 #!/bin/bash
 # Test the streaming Dia2 server
+#
+# Environment variables:
+#   SERVER_URL - Server URL (default: http://localhost:8000)
+#   VOICE_FILE - Voice warmup file (default: example_prefix1.wav)
 
-SERVER=${SERVER:-http://localhost:8000}
-VOICE_FILE=${VOICE_FILE:-example_prefix1.wav}
+export SERVER_URL=${SERVER_URL:-http://localhost:8000}
+export VOICE_FILE=${VOICE_FILE:-example_prefix1.wav}
 
-echo "Testing Dia2 Streaming Server at $SERVER"
+echo "Testing Dia2 Streaming Server at $SERVER_URL"
 echo "========================================"
 
 # Check health
 echo -e "\n1. Checking server health..."
-curl -s "$SERVER/health" | python3 -m json.tool
+curl -s "$SERVER_URL/health" | python3 -m json.tool
 
 # Set voice
 echo -e "\n2. Setting AI voice..."
-curl -s -X POST "$SERVER/set_voice" \
+curl -s -X POST "$SERVER_URL/set_voice" \
     -F "file=@$VOICE_FILE" | python3 -m json.tool
 
 # Test streaming with Python client
