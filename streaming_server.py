@@ -349,13 +349,16 @@ async def run_streaming_generation(
     positions_view = positions.expand(branches, -1)
     
     # Streaming state
-    first_word_frame: Optional[int] = None  # When first new_word token appears (start of actual content)
+    # Start decoding from start_step - that's where new content begins after prefix warmup
+    # (Don't wait for new_word token - it may not appear for all text entries)
+    content_start = start_step + 1  # First frame of new content is start_step + 1
     decode_pos = 0  # Next position to decode (in undelayed space)
     eos_cutoff = None
     total_samples = 0
     
     print(f"[Stream] Starting generation loop from step {start_step}...")
     print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
+    print(f"[Stream] content_start={content_start} (will decode from here)")
     gen_start = time.time()
     first_chunk_sent = False
     last_step = start_step - 1
@@ -412,15 +415,6 @@ async def run_streaming_generation(
             # State machine
             main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
             second_token = aux_token if aux_token != -1 else token_ids.pad
-            
-            # Track first word frame (marks start of actual generated content)
-            if first_word_frame is None and main_token == token_ids.new_word:
-                first_word_frame = t - config.initial_padding
-                print(f"[Stream] first_word_frame set to {first_word_frame} at step {t}")
-            
-            # Debug: print main_token periodically
-            if offset < 5 or offset % 20 == 0:
-                print(f"[Stream] step={t} main_token={main_token} (new_word={token_ids.new_word}) first_word_frame={first_word_frame}")
             
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = second_token
@@ -486,70 +480,70 @@ async def run_streaming_generation(
             # Decode and yield audio chunks
             # We can safely undelay position p if we have data up to p + max_delay
             # So we can decode up to: generation_pos - max_delay
-            if first_word_frame is not None:
-                # Start decoding from first_word_frame
-                if decode_pos < first_word_frame:
-                    decode_pos = first_word_frame
+            # Start decoding from content_start (after prefix)
+            if decode_pos < content_start:
+                decode_pos = content_start
+            
+            decodable_end = generation_pos - max_delay
+            frames_to_decode = decodable_end - decode_pos
                 
-                decodable_end = generation_pos - max_delay
-                frames_to_decode = decodable_end - decode_pos
+            if frames_to_decode >= CHUNK_FRAMES:
+                # Extract and undelay the frames
+                num_codebooks = len(delays)
+                chunk_tokens = torch.zeros(1, num_codebooks, frames_to_decode, dtype=torch.long, device=runtime.device)
+                    
+                for cb in range(num_codebooks):
+                    d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
+                    chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
                 
-                if offset < 20 or offset % 20 == 0:
-                    print(f"[Stream] decode check: decode_pos={decode_pos} decodable_end={decodable_end} frames_to_decode={frames_to_decode}")
+                chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
                 
-                if frames_to_decode >= CHUNK_FRAMES:
-                    # Extract and undelay the frames
-                    num_codebooks = len(delays)
-                    chunk_tokens = torch.zeros(1, num_codebooks, frames_to_decode, dtype=torch.long, device=runtime.device)
-                    
-                    for cb in range(num_codebooks):
-                        d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
-                        chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
-                    
-                    chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
-                    
-                    # Decode chunk
-                    pcm = runtime.mimi.decode(chunk_tokens)
-                    waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
-                    
-                    if waveform.shape[0] > 0:
-                        pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-                        total_samples += waveform.shape[0]
-                        
-                        if not first_chunk_sent:
-                            first_chunk_sent = True
-                            print(f"[Stream] First chunk sent after {time.time() - gen_start:.2f}s")
-                        
-                        yield (pcm16, False)
-                    
-                    decode_pos = decodable_end
+                # Decode chunk
+                pcm = runtime.mimi.decode(chunk_tokens)
+                waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
                 
-                # Yield to event loop
+                if waveform.shape[0] > 0:
+                    pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+                    total_samples += waveform.shape[0]
+                    
+                    if not first_chunk_sent:
+                        first_chunk_sent = True
+                        print(f"[Stream] First chunk sent after {time.time() - gen_start:.2f}s")
+                    
+                    yield (pcm16, False)
+                
+                decode_pos = decodable_end
+                
+            # Yield to event loop periodically
+            if offset % 3 == 0:
                 await asyncio.sleep(0)
     
     # Flush remaining frames
-    if first_word_frame is not None:
-        generation_pos = last_step + 2
-        decodable_end = min(generation_pos - max_delay, audio_buf.shape[-1] - max_delay)
+    generation_pos = last_step + 2
+    decodable_end = min(generation_pos - max_delay, audio_buf.shape[-1] - max_delay)
+    
+    if decode_pos < content_start:
+        decode_pos = content_start
         
-        if decodable_end > decode_pos:
-            num_codebooks = len(delays)
-            remaining_frames = decodable_end - decode_pos
-            chunk_tokens = torch.zeros(1, num_codebooks, remaining_frames, dtype=torch.long, device=runtime.device)
+    if decodable_end > decode_pos:
+        num_codebooks = len(delays)
+        remaining_frames = decodable_end - decode_pos
+        chunk_tokens = torch.zeros(1, num_codebooks, remaining_frames, dtype=torch.long, device=runtime.device)
+        
+        for cb in range(num_codebooks):  
+            d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
+            chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
+        
+        chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
+        
+        pcm = runtime.mimi.decode(chunk_tokens)
+        waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
+        
+        if waveform.shape[0] > 0:
+            pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+            total_samples += waveform.shape[0]
+            yield (pcm16, True)
             
-            for cb in range(num_codebooks):  
-                d = int(delays[cb]) if hasattr(delays, '__getitem__') else int(runtime.audio_delay_tensor[cb].item())
-                chunk_tokens[0, cb, :] = audio_buf[0, cb, decode_pos + d : decodable_end + d]
-            
-            chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
-            
-            pcm = runtime.mimi.decode(chunk_tokens)
-            waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
-            
-            if waveform.shape[0] > 0:
-                pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-                total_samples += waveform.shape[0]
-                yield (pcm16, True)
     
     # Update graph cache
     if graph_cache is not None:
