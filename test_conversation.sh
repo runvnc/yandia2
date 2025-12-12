@@ -44,7 +44,7 @@ echo ""
 echo "5. Generating AI response..."
 time curl -s -X POST "$SERVER/generate" \
   -F "text=Hello! Thank you for calling. How can I help you today?" \
-  -F "cfg_scale=2.0" \
+  -F "cfg_scale=1.0" \
   -F "temperature=0.8" \
   --output "$OUTDIR/02_ai_response.wav"
 echo ""
