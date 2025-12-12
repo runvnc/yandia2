@@ -310,17 +310,9 @@ async def run_streaming_generation(
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
         print(f"[Stream] Warmup done in {time.time() - warmup_start:.2f}s")
     
-    # Initialize Mimi streaming decoder
-    mimi_kv = None
-    
-    # If we have prefix, warm up Mimi's KV cache with prefix tokens
-    if prefix_plan is not None:
-        prefix_len = prefix_plan.aligned_frames
-        prefix_tokens = gen_state.audio_buf[0:1, :, :prefix_len].clone()
-        # Clamp to valid range
-        prefix_tokens = torch.clamp(prefix_tokens, 0, 2047)
-        _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
-        print(f"[Stream] Mimi KV warmed up with {prefix_len} prefix frames")
+    # Note: We use regular decode() for each chunk instead of streaming decode
+    # The HuggingFace MimiModel doesn't have decode_streaming, but chunk-by-chunk
+    # decoding works fine since Mimi's decoder is relatively frame-independent
     
     # Setup tensors for generation loop
     step_tokens = gen_state.step_tokens
@@ -486,9 +478,9 @@ async def run_streaming_generation(
                 chunk_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
                 chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
                 
-                # Decode with streaming (maintains KV state)
-                pcm, mimi_kv = runtime.mimi.decode_streaming(chunk_tokens, mimi_kv)
-                waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                # Decode chunk (using regular decode, not streaming)
+                pcm = runtime.mimi.decode(chunk_tokens)
+                waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
                 
                 if waveform.shape[0] > 0:
                     # Skip initial samples if needed (undelay artifacts)
@@ -520,8 +512,8 @@ async def run_streaming_generation(
         chunk_tokens = audio_buf[0:1, :, last_decode_pos:final_pos].clone()
         chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
         
-        pcm, mimi_kv = runtime.mimi.decode_streaming(chunk_tokens, mimi_kv)
-        waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+        pcm = runtime.mimi.decode(chunk_tokens)
+        waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
         
         if waveform.shape[0] > 0:
             if samples_skipped < undelay_samples:
