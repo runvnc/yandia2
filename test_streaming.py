@@ -45,7 +45,8 @@ VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
 async def setup_voice(server_url: str, voice_file: str):
     """Upload voice warmup file."""
     print(f"Setting voice from: {voice_file}")
-    async with httpx.AsyncClient() as client:
+    # Use longer timeout for Whisper transcription (can take 30-60s on first run)
+    async with httpx.AsyncClient(timeout=120.0) as client:
         with open(voice_file, "rb") as f:
             response = await client.post(
                 f"{server_url}/set_voice",
@@ -141,7 +142,8 @@ async def stream_tts(text: str, output_file: str = "streaming_output.wav"):
 async def main():
     # Check if server is running
     try:
-        async with httpx.AsyncClient() as client:
+        # Use longer timeout for initial health check too
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{SERVER_URL}/health")
             health = response.json()
             print(f"Server health: {health}")
