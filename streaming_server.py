@@ -285,7 +285,10 @@ async def run_generation_with_dia_generate(
     """
     print(f"[DiagGen] Using dia.generate() directly")
     print(f"[DiagGen] prefix_speaker_1={last_ai_audio}")
-    print(f"[DiagGen] prefix_speaker_2={last_user_audio}")
+    
+    # IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
+    speaker_2_audio = last_user_audio or last_ai_audio
+    print(f"[DiagGen] prefix_speaker_2={speaker_2_audio}")
     
     gen_start = time.time()
     
@@ -294,7 +297,7 @@ async def run_generation_with_dia_generate(
         text,
         config=config,
         prefix_speaker_1=last_ai_audio,
-        prefix_speaker_2=last_user_audio,
+        prefix_speaker_2=speaker_2_audio,
         verbose=True,
     )
     
@@ -758,10 +761,13 @@ async def websocket_generate(websocket: WebSocket):
                 use_cuda_graph=True,
             )
             
-            # Build prefix plan
+            # Build prefix plan - IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
+            # If no user audio, fall back to AI audio for speaker_2
+            speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+            
             prefix_config = PrefixConfig(
                 speaker_1=conversation.last_ai_audio,
-                speaker_2=conversation.last_user_audio,
+                speaker_2=speaker_2_audio,
             )
             prefix_plan = build_prefix_plan(runtime, prefix_config)
             
@@ -909,11 +915,15 @@ async def generate(
     start = time.time()
     
     try:
+        # IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
+        # If no user audio, fall back to AI audio for speaker_2
+        speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+        
         result = dia.generate(
             text,
             config=config,
             prefix_speaker_1=conversation.last_ai_audio,
-            prefix_speaker_2=conversation.last_user_audio,
+            prefix_speaker_2=speaker_2_audio,
             verbose=True,
         )
         
