@@ -269,6 +269,49 @@ async def user_spoke(file: UploadFile = File(...)):
     }
 
 
+async def run_generation_with_dia_generate(
+    dia_instance,
+    text: str,
+    last_ai_audio: Optional[str],
+    last_user_audio: Optional[str],
+    config: GenerationConfig,
+) -> AsyncGenerator[Tuple[bytes, bool], None]:
+    """
+    DIAGNOSTIC VERSION 2: Uses dia.generate() directly (the known working method),
+    then streams the result through websocket.
+    
+    If this works -> the issue is in my prefix_plan setup
+    If this fails -> something else is wrong
+    """
+    print(f"[DiagGen] Using dia.generate() directly")
+    print(f"[DiagGen] prefix_speaker_1={last_ai_audio}")
+    print(f"[DiagGen] prefix_speaker_2={last_user_audio}")
+    
+    gen_start = time.time()
+    
+    # Use the EXACT same call as the working /generate endpoint
+    result = dia_instance.generate(
+        text,
+        config=config,
+        prefix_speaker_1=last_ai_audio,
+        prefix_speaker_2=last_user_audio,
+        verbose=True,
+    )
+    
+    gen_time = time.time() - gen_start
+    duration = result.waveform.shape[-1] / result.sample_rate
+    print(f"[DiagGen] Generation done in {gen_time:.2f}s, audio={duration:.2f}s")
+    
+    # Convert to PCM and yield
+    waveform = result.waveform
+    if waveform.dim() > 1:
+        waveform = waveform.squeeze()
+    waveform = torch.clamp(waveform, -1.0, 1.0)
+    pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+    
+    yield (pcm16, True)
+
+
 async def run_generation_with_original_loop(
     runtime,
     text: str,
@@ -688,7 +731,10 @@ async def websocket_generate(websocket: WebSocket):
             
             if data.get("type") == "config":
                 use_original_loop = data.get("use_original_loop", False)
-                print(f"[WS] Config: use_original_loop={use_original_loop}")
+                use_dia_generate = data.get("use_dia_generate", False)
+                print(f"[WS] Config: use_original_loop={use_original_loop}, use_dia_generate={use_dia_generate}")
+                if use_dia_generate:
+                    use_original_loop = "dia_generate"  # Special flag
                 continue
             
             text = data.get("text", "")
@@ -734,7 +780,15 @@ async def websocket_generate(websocket: WebSocket):
                 dia._graph_cache = create_graph_cache(runtime)
             
             # Stream audio chunks
-            if use_original_loop:
+            if use_original_loop == "dia_generate":
+                print(f"[WS] Using dia.generate() directly (diagnostic mode 2)")
+                generator = run_generation_with_dia_generate(
+                    dia, text, 
+                    conversation.last_ai_audio,
+                    conversation.last_user_audio,
+                    config
+                )
+            elif use_original_loop:
                 print(f"[WS] Using ORIGINAL generation loop (diagnostic mode)")
                 generator = run_generation_with_original_loop(
                     runtime, text, prefix_plan, config, dia._graph_cache
