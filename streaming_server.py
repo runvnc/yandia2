@@ -355,6 +355,7 @@ async def run_streaming_generation(
     total_samples = 0
     
     print(f"[Stream] Starting generation loop from step {start_step}...")
+    print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
     gen_start = time.time()
     first_chunk_sent = False
     last_step = start_step - 1
@@ -415,6 +416,11 @@ async def run_streaming_generation(
             # Track first word frame (marks start of actual generated content)
             if first_word_frame is None and main_token == token_ids.new_word:
                 first_word_frame = t - config.initial_padding
+                print(f"[Stream] first_word_frame set to {first_word_frame} at step {t}")
+            
+            # Debug: print main_token periodically
+            if offset < 5 or offset % 20 == 0:
+                print(f"[Stream] step={t} main_token={main_token} (new_word={token_ids.new_word}) first_word_frame={first_word_frame}")
             
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = second_token
@@ -487,6 +493,9 @@ async def run_streaming_generation(
                 
                 decodable_end = generation_pos - max_delay
                 frames_to_decode = decodable_end - decode_pos
+                
+                if offset < 20 or offset % 20 == 0:
+                    print(f"[Stream] decode check: decode_pos={decode_pos} decodable_end={decodable_end} frames_to_decode={frames_to_decode}")
                 
                 if frames_to_decode >= CHUNK_FRAMES:
                     # Extract and undelay the frames
