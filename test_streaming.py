@@ -35,10 +35,19 @@ except ImportError:
     sys.exit(1)
 
 
-# Configurable URLs via environment variables
+# Configurable via environment variables
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
-WS_URL = os.environ.get("WS_URL", "ws://localhost:8000/ws/generate")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
+
+# Derive WS_URL from SERVER_URL if not explicitly set
+if "WS_URL" in os.environ:
+    WS_URL = os.environ["WS_URL"]
+else:
+    # Convert http(s):// to ws(s)://
+    if SERVER_URL.startswith("https://"):
+        WS_URL = "wss://" + SERVER_URL[8:] + "/ws/generate"
+    else:
+        WS_URL = "ws://" + SERVER_URL[7:] + "/ws/generate"
 
 
 
