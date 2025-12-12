@@ -13,6 +13,7 @@ Environment variables:
     SERVER_URL - HTTP server URL (default: http://localhost:8000)
     WS_URL - WebSocket URL (default: ws://localhost:8000/ws/generate)
     VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
+    USE_ORIGINAL_LOOP - Set to "1" to use diagnostic mode with original generation loop
 """
 import asyncio
 import json
@@ -38,6 +39,7 @@ except ImportError:
 # Configurable via environment variables
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
+USE_ORIGINAL_LOOP = os.environ.get("USE_ORIGINAL_LOOP", "") == "1"
 
 # Derive WS_URL from SERVER_URL if not explicitly set
 if "WS_URL" in os.environ:
@@ -78,6 +80,13 @@ async def stream_tts(text: str, output_file: str = "streaming_output.wav"):
         if data.get("error"):
             print(f"Error: {data['error']}")
             return
+        
+        # Send config if using original loop
+        if USE_ORIGINAL_LOOP:
+            print("\n*** DIAGNOSTIC MODE: Using original generation loop ***\n")
+            await ws.send(json.dumps({"type": "config", "use_original_loop": True}))
+        else:
+            print("\n*** STREAMING MODE: Using custom streaming loop ***\n")
         
         sample_rate = data.get("sample_rate", 24000)
         

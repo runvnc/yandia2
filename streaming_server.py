@@ -36,6 +36,8 @@ from dia2.runtime.script_parser import parse_script
 from dia2.runtime.generator import (
     build_initial_state,
     warmup_with_prefix,
+    run_generation_loop,
+    decode_audio,
     GenerationState,
     CachedGraphState,
     create_graph_cache,
@@ -48,6 +50,7 @@ from dia2.runtime.generator import (
     _execute_depformer_stage,
     _execute_depformer_graph,
 )
+from dia2.audio.grid import undelay_frames
 from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
 from dia2.audio.grid import mask_audio_logits, delay_frames, undelay_frames
@@ -264,6 +267,86 @@ async def user_spoke(file: UploadFile = File(...)):
         "message": "User audio added",
         "path": str(user_path)
     }
+
+
+async def run_generation_with_original_loop(
+    runtime,
+    text: str,
+    prefix_plan: Optional[PrefixPlan],
+    config: GenerationConfig,
+    graph_cache: Optional[CachedGraphState],
+) -> AsyncGenerator[Tuple[bytes, bool], None]:
+    """
+    DIAGNOSTIC VERSION: Uses the original run_generation_loop from generator.py,
+    then decodes and streams the audio AFTER generation completes.
+    
+    This tests whether the issue is in my custom generation loop or elsewhere.
+    """
+    from dia2.runtime.logger import RuntimeLogger
+    
+    token_ids = runtime.constants
+    
+    # Build entries from prefix + new text (same as engine.py)
+    entries = []
+    if prefix_plan is not None:
+        entries.extend(prefix_plan.entries)
+    entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+    
+    runtime.machine.initial_padding = config.initial_padding
+    
+    # Create FRESH state machine
+    state = runtime.machine.new_state(entries)
+    
+    # Setup generation state (same as engine.py)
+    if graph_cache is not None:
+        reset_graph_cache(graph_cache, runtime, prefix_plan)
+        gen_state = graph_cache.generation
+    else:
+        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+    
+    start_step = 0
+    if prefix_plan is not None:
+        print(f"[DiagLoop] Warming up with prefix ({prefix_plan.aligned_frames} frames)...")
+        start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+        print(f"[DiagLoop] Warmup done, start_step={start_step}")
+    
+    logger = RuntimeLogger(verbose=True)
+    
+    # Use the ORIGINAL run_generation_loop from generator.py
+    print(f"[DiagLoop] Running ORIGINAL generation loop...")
+    gen_start = time.time()
+    
+    first_word_frame, audio_buf = run_generation_loop(
+        runtime,
+        state=state,
+        generation=gen_state,
+        config=config,
+        start_step=start_step,
+        logger=logger,
+        graph_cache=graph_cache,
+    )
+    
+    gen_time = time.time() - gen_start
+    print(f"[DiagLoop] Generation done in {gen_time:.2f}s, first_word_frame={first_word_frame}")
+    
+    # Decode using the SAME logic as engine.py
+    include_prefix_audio = False  # Don't include prefix
+    aligned = undelay_frames(audio_buf[0], runtime.audio_delays, runtime.constants.audio_pad).unsqueeze(0)
+    crop = 0 if include_prefix_audio else max(first_word_frame, 0)
+    if crop > 0 and crop < aligned.shape[-1]:
+        aligned = aligned[:, :, crop:]
+    
+    print(f"[DiagLoop] Decoding {aligned.shape[-1]} frames (cropped {crop} prefix frames)...")
+    waveform = decode_audio(runtime, aligned)
+    
+    duration = waveform.shape[-1] / runtime.mimi.sample_rate
+    print(f"[DiagLoop] Decoded {duration:.2f}s audio")
+    
+    # Convert to PCM and yield as single chunk
+    waveform = torch.clamp(waveform, -1.0, 1.0)
+    pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+    
+    yield (pcm16, True)
 
 
 async def run_streaming_generation(
@@ -591,6 +674,9 @@ async def websocket_generate(websocket: WebSocket):
         "sample_width": 2,  # 16-bit
     }))
     
+    # Config flag for diagnostic mode
+    use_original_loop = False
+    
     try:
         while True:
             # Wait for text input
@@ -599,6 +685,11 @@ async def websocket_generate(websocket: WebSocket):
             
             if data.get("type") == "close":
                 break
+            
+            if data.get("type") == "config":
+                use_original_loop = data.get("use_original_loop", False)
+                print(f"[WS] Config: use_original_loop={use_original_loop}")
+                continue
             
             text = data.get("text", "")
             if not text:
@@ -643,10 +734,18 @@ async def websocket_generate(websocket: WebSocket):
                 dia._graph_cache = create_graph_cache(runtime)
             
             # Stream audio chunks
+            if use_original_loop:
+                print(f"[WS] Using ORIGINAL generation loop (diagnostic mode)")
+                generator = run_generation_with_original_loop(
+                    runtime, text, prefix_plan, config, dia._graph_cache
+                )
+            else:
+                generator = run_streaming_generation(
+                    runtime, text, prefix_plan, config, dia._graph_cache
+                )
+            
             audio_chunks = []
-            async for chunk, is_final in run_streaming_generation(
-                runtime, text, prefix_plan, config, dia._graph_cache
-            ):
+            async for chunk, is_final in generator:
                 # Send binary chunk with header
                 header = struct.pack("!?", is_final)
                 await websocket.send_bytes(header + chunk)
