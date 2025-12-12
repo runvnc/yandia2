@@ -303,11 +303,15 @@ async def generate(
     start = time.time()
     
     try:
+        # IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
+        # If no user audio, fall back to AI audio for speaker_2
+        speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+        
         result = dia.generate(
             text,
             config=config,
             prefix_speaker_1=conversation.last_ai_audio,
-            prefix_speaker_2=conversation.last_user_audio,
+            prefix_speaker_2=speaker_2_audio,
             verbose=True,
         )
         
