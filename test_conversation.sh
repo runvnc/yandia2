@@ -4,10 +4,15 @@
 
 # Default to localhost, override with: SERVER=https://your-url ./test_conversation.sh
 SERVER="${SERVER:-http://localhost:8000}"
+OUTDIR="/tmp/dia2_conversation"
 
 echo "=== Testing Dia2 Conversation Server ==="
 echo "Server: $SERVER"
+echo "Output dir: $OUTDIR"
 echo ""
+
+# Create output directory
+mkdir -p "$OUTDIR"
 
 # Check health
 echo "1. Checking server health..."
@@ -21,12 +26,16 @@ echo ""
 
 # Set AI voice (using example_prefix1.wav as the AI warmup)
 echo "3. Setting AI voice (this will transcribe - takes ~10-20s first time)..."
+cp example_prefix1.wav "$OUTDIR/00_ai_warmup.wav"
+echo "   Copied example_prefix1.wav -> $OUTDIR/00_ai_warmup.wav"
 time curl -s -X POST "$SERVER/set_voice" \
   -F "file=@example_prefix1.wav" | python3 -m json.tool
 echo ""
 
 # Simulate user speaking (using example_prefix2.wav as user audio)
 echo "4. User spoke (this will transcribe - takes ~10-20s first time)..."
+cp example_prefix2.wav "$OUTDIR/01_user_spoke.wav"
+echo "   Copied example_prefix2.wav -> $OUTDIR/01_user_spoke.wav"
 time curl -s -X POST "$SERVER/user_spoke" \
   -F "file=@example_prefix2.wav" | python3 -m json.tool
 echo ""
@@ -37,9 +46,9 @@ time curl -s -X POST "$SERVER/generate" \
   -F "text=Hello! Thank you for calling. How can I help you today?" \
   -F "cfg_scale=2.0" \
   -F "temperature=0.8" \
-  --output /tmp/conv_turn1.wav
+  --output "$OUTDIR/02_ai_response.wav"
 echo ""
-echo "   Output: /tmp/conv_turn1.wav"
+echo "   Output: $OUTDIR/02_ai_response.wav"
 
 # Check state
 echo ""
@@ -51,14 +60,18 @@ echo ""
 echo "7. Generating second AI response (no new user audio)..."
 time curl -s -X POST "$SERVER/generate" \
   -F "text=I'm Mary from customer service. Are you calling about your account?" \
-  --output /tmp/conv_turn2.wav
+  --output "$OUTDIR/03_ai_response.wav"
 echo ""
-echo "   Output: /tmp/conv_turn2.wav"
+echo "   Output: $OUTDIR/03_ai_response.wav"
 
 echo ""
 echo "=== Test Complete ==="
-echo "Check /tmp/conv_turn1.wav and /tmp/conv_turn2.wav"
 echo ""
-echo "To play (if you have aplay):"
-echo "  aplay /tmp/conv_turn1.wav"
-echo "  aplay /tmp/conv_turn2.wav"
+echo "Conversation files in $OUTDIR:"
+ls -la "$OUTDIR/"*.wav 2>/dev/null
+echo ""
+echo "To play the full conversation:"
+echo "  for f in $OUTDIR/*.wav; do echo Playing \$f; aplay \$f; done"
+echo ""
+echo "Or concatenate into one file:"
+echo "  sox $OUTDIR/*.wav $OUTDIR/full_conversation.wav"
