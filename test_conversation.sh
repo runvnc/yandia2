@@ -1,11 +1,12 @@
 #!/bin/bash
 # Test script for the Dia2 Conversation Server
-# Demonstrates a full conversation flow
+# Run this from the yandia2 directory
 
-SERVER="http://localhost:8000"
-PREFIX_DIR="/files/yandia2"
+# Default to localhost, override with: SERVER=https://your-url ./test_conversation.sh
+SERVER="${SERVER:-http://localhost:8000}"
 
 echo "=== Testing Dia2 Conversation Server ==="
+echo "Server: $SERVER"
 echo ""
 
 # Check health
@@ -21,13 +22,13 @@ echo ""
 # Set AI voice (using example_prefix1.wav as the AI warmup)
 echo "3. Setting AI voice (this will transcribe - takes ~10-20s first time)..."
 time curl -s -X POST "$SERVER/set_voice" \
-  -F "file=@$PREFIX_DIR/example_prefix1.wav" | python3 -m json.tool
+  -F "file=@example_prefix1.wav" | python3 -m json.tool
 echo ""
 
 # Simulate user speaking (using example_prefix2.wav as user audio)
 echo "4. User spoke (this will transcribe - takes ~10-20s first time)..."
 time curl -s -X POST "$SERVER/user_spoke" \
-  -F "file=@$PREFIX_DIR/example_prefix2.wav" | python3 -m json.tool
+  -F "file=@example_prefix2.wav" | python3 -m json.tool
 echo ""
 
 # Generate AI response
