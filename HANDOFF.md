@@ -1,6 +1,6 @@
 # Yandia2 Project Handoff Document
 
-**Date**: December 12, 2024  
+**Date**: December 12, 2025  
 **Project**: `/files/yandia2`  
 **GitHub**: `https://github.com/runvnc/yandia2`
 
@@ -8,7 +8,8 @@
 
 ## Executive Summary
 
-Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching for faster generation. It manages stateful conversations where:
+Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching for faster generation.
+Now includes **WebSocket streaming** for low-latency audio output. It manages stateful conversations where:
 1. An AI voice warmup is set
 2. User audio is provided  
 3. Text is generated as speech using the conversation context
@@ -30,10 +31,13 @@ Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching fo
 │   │   └── ...
 │   └── ...
 ├── conversation_server.py     # FastAPI server (stateful conversation)
+├── streaming_server.py        # FastAPI server with WebSocket streaming ⭐ NEW
 ├── simple_server.py           # FastAPI server (stateless)
 ├── example_prefix1.wav        # Example AI voice (Speaker 1)
 ├── example_prefix2.wav        # Example user voice (Speaker 2)
 ├── test_conversation.sh       # Test script
+├── test_streaming.sh          # Test streaming script ⭐ NEW
+├── test_streaming.py          # Python WebSocket test client ⭐ NEW
 ├── requirements.txt           # For pip install
 ├── pyproject.toml             # For uv
 └── HANDOFF.md                 # This document
@@ -47,6 +51,7 @@ Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching fo
 |-----|-------------|
 | `working_conv_very_slow` | Before graph caching (~10s, RTF ~2.5-3.0) |
 | `working_rtf_1.6` | With graph caching (~5-6s, RTF ~1.6) |
+| `streaming_v1` | With WebSocket streaming (~2-3s to first audio) |
 
 ```bash
 # To restore if something breaks:
@@ -55,7 +60,7 @@ git checkout working_rtf_1.6
 
 ---
 
-## API Endpoints (conversation_server.py)
+## API Endpoints (conversation_server.py / streaming_server.py)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -64,6 +69,7 @@ git checkout working_rtf_1.6
 | `/set_voice` | POST | Upload AI warmup audio (file) |
 | `/user_spoke` | POST | Upload user audio (file) |
 | `/generate` | POST | Generate AI speech from text |
+| `/ws/generate` | WebSocket | Stream audio chunks (streaming_server.py only) |
 | `/state` | GET | Get current conversation state |
 
 ### Conversation Flow
@@ -76,6 +82,61 @@ git checkout working_rtf_1.6
 5. POST /generate     {text: "..."}  → Returns WAV
 ... repeat 4-5 ...
 ```
+
+### Streaming Flow (WebSocket)
+
+```
+1. POST /set_voice         [AI warmup audio]
+2. POST /user_spoke        [User audio]  
+3. WebSocket /ws/generate  
+   → Client sends: {"text": "Hello..."}
+   → Server streams: binary audio chunks
+   → Server sends: {"event": "done", "duration": 1.5}
+```
+
+---
+
+## Streaming Implementation ⭐ NEW
+
+The `streaming_server.py` adds WebSocket streaming capability for low-latency TTS.
+
+### How It Works
+
+1. **Warmup phase** (~1-2s) - Unavoidable, builds KV cache for prefix audio
+2. **Generation loop** - Generates tokens and decodes audio incrementally
+3. **Chunk streaming** - Every 3 frames (~125ms), decode and send audio
+4. **Mimi streaming** - Uses `decode_streaming()` to maintain decoder KV state
+
+### Key Design Decisions
+
+- **CHUNK_FRAMES = 3** - Decode every 3 frames for balance of latency vs overhead
+- **UNDELAY_FRAMES = 8** - Skip first 8 frames of audio (codec delay artifacts)
+- **Reuses CUDA graph cache** - Same graph caching as non-streaming version
+- **Fresh State each call** - State machine is always created fresh
+
+### WebSocket Protocol
+
+```python
+# Client → Server
+{"text": "Hello world", "cfg_scale": 1.0, "temperature": 0.8, "top_k": 50}
+
+# Server → Client (events)
+{"event": "ready", "sample_rate": 24000}
+{"event": "generating"}
+{"event": "done", "duration": 1.5, "total_time": 2.3}
+
+# Server → Client (audio)
+Binary: [1 byte is_final flag] + [16-bit PCM samples]
+```
+
+### Expected Latency
+
+| Phase | Time |
+|-------|------|
+| Warmup (unavoidable) | ~1-2s |
+| First audio chunk | ~600-800ms after generation starts |
+| Subsequent chunks | ~100-150ms intervals |
+| **Total to first audio** | **~2-3s** |
 
 ---
 
@@ -174,45 +235,6 @@ The 0.6 RTF (faster than realtime) was measuring ONLY the generation loop after 
 
 ---
 
-## Next Steps: Streaming Output
-
-### Goal
-
-Reduce time-to-first-audio from ~5-6s to ~2-3s by streaming audio chunks during generation.
-
-### Architecture
-
-```
-Current:  Generate ALL tokens → Decode ALL → Return
-Streaming: Generate 10 frames → Decode → Send chunk → Repeat
-```
-
-### Key Components Needed
-
-1. **Mimi's `decode_streaming()`** - Already exists, maintains KV state
-2. **Yield chunks in generation loop** - Every N frames
-3. **WebSocket endpoint** - `/generate_stream` for pushing chunks
-4. **Handle delay pattern** - First ~8 frames don't produce valid audio
-
-### Expected Latency (Streaming)
-
-| Phase | Time |
-|-------|------|
-| Warmup (unavoidable) | ~1-2s |
-| First audio chunk | ~600-800ms after generation starts |
-| Subsequent chunks | ~150-250ms intervals |
-| **Total to first audio** | **~2-3s** |
-
-### Reference Code
-
-The `/files/stream-dia2` project has streaming infrastructure:
-- `streaming_generator.py` - `run_streaming_generation()` yields `StreamingChunk`
-- `realtime_dia2_server.py` - WebSocket handling, `ContinuousSession`
-
-Can be ported to yandia2 now that core generation is working.
-
----
-
 ## Configuration
 
 ### Defaults (conversation_server.py)
@@ -238,6 +260,9 @@ use_cuda_graph: bool = True       # In engine.py generate()
 ```bash
 cd /files/yandia2
 
+# Non-streaming server:
+cd /files/yandia2
+
 # With uv:
 uv sync
 uv run python conversation_server.py
@@ -248,12 +273,25 @@ python conversation_server.py
 
 # Or with uvicorn:
 uvicorn conversation_server:app --host 0.0.0.0 --port 8000
+
+# Streaming server:
+uv run python streaming_server.py
+# or
+uvicorn streaming_server:app --host 0.0.0.0 --port 8000
 ```
 
 ### Testing
 
 ```bash
+# Non-streaming:
 SERVER=http://localhost:8000 ./test_conversation.sh
+
+# Streaming:
+chmod +x test_streaming.sh
+./test_streaming.sh
+
+# Or manually:
+python test_streaming.py "Hello, this is a test."
 ```
 
 ---
@@ -295,6 +333,8 @@ def pcm_to_ulaw(pcm_24khz: bytes) -> bytes:
 | `dia2/engine.py` | Added `_graph_cache`, `use_graph_cache` param, `clear_graph_cache()` |
 | `dia2/runtime/generator.py` | Added `CachedGraphState`, `create_graph_cache()`, `reset_graph_cache()`, fixed `trim_audio()` |
 | `dia2/runtime/context.py` | Fixed PyTorch compatibility for `cudnn.conv` |
+| `streaming_server.py` | New file: WebSocket streaming server |
+| `test_streaming.py` | New file: WebSocket test client |
 
 ---
 
