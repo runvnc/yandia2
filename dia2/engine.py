@@ -10,6 +10,10 @@ from .runtime.generator import (
     decode_audio,
     run_generation_loop,
     warmup_with_prefix,
+    # NEW: Graph caching support
+    CachedGraphState,
+    create_graph_cache,
+    reset_graph_cache,
 )
 from .runtime.script_parser import parse_script
 from .audio.grid import undelay_frames, write_wav
@@ -21,6 +25,7 @@ from .generation import (
     normalize_script,
 )
 from .runtime.logger import RuntimeLogger
+
 
 class Dia2:
     def __init__(
@@ -49,6 +54,8 @@ class Dia2:
         self._dtype_pref = dtype or "auto"
         self.default_config = default_config or GenerationConfig()
         self._runtime: Optional[RuntimeContext] = None
+        # NEW: Graph cache for faster generation after first call
+        self._graph_cache: Optional[CachedGraphState] = None
 
     @classmethod
     def from_repo(
@@ -89,9 +96,16 @@ class Dia2:
         self.device = device
         self._dtype_pref = desired_dtype
         self._runtime = None
+        # Clear graph cache when device changes
+        self._graph_cache = None
 
     def close(self) -> None:
         self._runtime = None
+        self._graph_cache = None
+
+    def clear_graph_cache(self) -> None:
+        """Clear the CUDA graph cache, forcing recompilation on next generate()."""
+        self._graph_cache = None
 
     def _ensure_runtime(self) -> RuntimeContext:
         if self._runtime is None:
@@ -108,8 +122,22 @@ class Dia2:
         prefix_speaker_2: Optional[str] = None,
         include_prefix: Optional[bool] = None,
         verbose: bool = False,
+        use_graph_cache: bool = True,  # NEW: Enable/disable graph caching
         **overrides,
     ):
+        """Generate speech from text.
+        
+        Args:
+            script: Text to speak (use [S1]/[S2] tags for speaker changes)
+            config: Generation configuration
+            output_wav: Optional path to save output WAV file
+            prefix_speaker_1: Path to speaker 1 voice sample
+            prefix_speaker_2: Path to speaker 2 voice sample
+            include_prefix: Whether to include prefix audio in output
+            verbose: Enable verbose logging
+            use_graph_cache: If True, reuse CUDA graphs across calls (faster)
+            **overrides: Additional config overrides
+        """
         runtime = self._ensure_runtime()
         logger = RuntimeLogger(verbose)
         merged_overrides = dict(overrides)
@@ -122,28 +150,65 @@ class Dia2:
         merged = merge_generation_config(base=config or self.default_config, overrides=merged_overrides)
         max_context = runtime.config.runtime.max_context_steps
         text = normalize_script(script)
+        
+        # Build prefix plan (always fresh)
         prefix_plan = build_prefix_plan(runtime, merged.prefix)
+        
+        # Build entries list: prefix entries + new text entries
+        # This is the SAME logic as the working version
         entries = []
         if prefix_plan is not None:
             entries.extend(prefix_plan.entries)
         entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+        
         runtime.machine.initial_padding = merged.initial_padding
         logger.event(
             f"starting generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} "
             f"device={self.device} dtype={self._dtype_pref}"
         )
+        
+        # Create FRESH state machine - CRITICAL for avoiding "re-read" bug
+        # The state tracks what text to generate and MUST be fresh each call
         state = runtime.machine.new_state(entries)
+        
         cfg_active = merged.cfg_scale != 1.0
         if cfg_active:
             logger.event(f"classifier-free guidance enabled (scale={merged.cfg_scale:.2f})")
         else:
             logger.event("classifier-free guidance disabled (scale=1.0)")
-        gen_state = build_initial_state(
-            runtime,
-            prefix=prefix_plan,
+        
+        # Determine if we should use graph caching
+        should_use_cache = (
+            use_graph_cache 
+            and merged.use_cuda_graph 
+            and runtime.device.type == "cuda"
         )
+        
+        if should_use_cache:
+            # Get or create graph cache
+            if self._graph_cache is None:
+                logger.event("creating graph cache (first generation will compile graphs)")
+                self._graph_cache = create_graph_cache(runtime)
+            else:
+                logger.event("using cached graphs (fast path)")
+            
+            # Reset cache for new generation - resets tensor VALUES, keeps tensor OBJECTS
+            # This copies prefix audio into the buffer
+            reset_graph_cache(self._graph_cache, runtime, prefix_plan)
+            
+            # Use the cached GenerationState - same tensor objects as captured graphs
+            gen_state = self._graph_cache.generation
+            graph_cache = self._graph_cache
+        else:
+            # Original behavior - build fresh state each time
+            gen_state = build_initial_state(runtime, prefix=prefix_plan)
+            graph_cache = None
+        
         include_prefix_audio = bool(prefix_plan and merged.prefix and merged.prefix.include_audio)
         start_step = 0
+        
+        # Warmup with prefix - builds KV cache
+        # This runs in EAGER mode (no graphs) because prefix length varies
         if prefix_plan is not None:
             logger.event(f"warming up with prefix ({prefix_plan.aligned_frames} frames)")
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
@@ -151,14 +216,18 @@ class Dia2:
                 logger.event("prefix audio will be kept in output")
             else:
                 logger.event("prefix audio trimmed from output")
+        
+        # Run generation loop - uses cached graphs if available
         first_word_frame, audio_buf = run_generation_loop(
             runtime,
-            state=state,
-            generation=gen_state,
+            state=state,  # Fresh state machine
+            generation=gen_state,  # Cached or fresh GenerationState
             config=merged,
             start_step=start_step,
             logger=logger,
+            graph_cache=graph_cache,  # Pass cache for graph reuse
         )
+        
         aligned = undelay_frames(audio_buf[0], runtime.audio_delays, runtime.constants.audio_pad).unsqueeze(0)
         crop = 0 if include_prefix_audio else max(first_word_frame, 0)
         if crop > 0 and crop < aligned.shape[-1]:

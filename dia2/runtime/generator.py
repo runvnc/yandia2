@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Any
 
 import torch
 
@@ -27,6 +27,8 @@ def _ensure_graph_cublas_ready(device: torch.device) -> None:
     torch.matmul(tmp, tmp)
     torch.cuda.synchronize()
     _GRAPH_CUBLAS_READY = True
+
+
 @dataclass
 class GenerationState:
     decode: DecodeState
@@ -65,6 +67,34 @@ class NetworkBuffers:
     text: torch.Tensor
     cb0: torch.Tensor
     dep: list[torch.Tensor]
+
+
+@dataclass
+class CachedGraphState:
+    """Holds cached tensors and CUDA graphs for reuse across generate() calls.
+    
+    This enables graph replay without recompilation, significantly speeding up
+    subsequent generations after the first one.
+    
+    IMPORTANT: Only tensors are cached here. The State (state machine) must be
+    created fresh for each generation to avoid the "re-read prefix" bug.
+    """
+    # Core generation state (tensors we reuse)
+    generation: GenerationState
+    
+    # Tensors created in run_generation_loop that graphs reference
+    positions: torch.Tensor
+    main_tokens: torch.Tensor
+    aux_tokens: torch.Tensor
+    buffers: NetworkBuffers
+    
+    # CUDA graph captures
+    transformer_capture: Optional[Tuple[Any, torch.Tensor]] = None
+    dep_captures: Optional[List[Dict]] = None
+    
+    # Metadata
+    branches: int = 2
+    is_initialized: bool = False
 
 
 def _allocate_network_buffers(runtime: RuntimeContext, branches: int) -> NetworkBuffers:
@@ -119,6 +149,91 @@ def build_initial_state(
         if branches > 1:
             audio_buf[1:, :, : delayed.shape[1]] = delayed
     return GenerationState(decode_state, step_tokens, audio_buf)
+
+
+def create_graph_cache(runtime: RuntimeContext) -> CachedGraphState:
+    """Create a new graph cache with pre-allocated tensors.
+    
+    The tensors are allocated with max_context_steps size so they can handle
+    any prefix length without reallocation.
+    """
+    dep_q = runtime.model.depformer.num_audio_channels
+    channels = 2 + dep_q
+    branches = 2
+    token_ids = runtime.constants
+    
+    # Allocate step_tokens
+    step_tokens = torch.full(
+        (branches, channels, 1),
+        token_ids.pad,
+        dtype=torch.long,
+        device=runtime.device,
+    )
+    
+    # Use fixed max size for audio_buf to handle any prefix
+    limit = runtime.config.runtime.max_context_steps
+    total_steps = limit + 300 + 1  # 300 frames buffer for prefix (~24s of audio)
+    
+    decode_state = runtime.model.init_state(branches, runtime.device, total_steps)
+    audio_buf = torch.full(
+        (branches, dep_q, total_steps),
+        token_ids.ungenerated,
+        dtype=torch.long,
+        device=runtime.device,
+    )
+    
+    generation = GenerationState(decode_state, step_tokens, audio_buf)
+    
+    # Allocate loop tensors
+    positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+    main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    buffers = _allocate_network_buffers(runtime, branches)
+    
+    return CachedGraphState(
+        generation=generation,
+        positions=positions,
+        main_tokens=main_tokens,
+        aux_tokens=aux_tokens,
+        buffers=buffers,
+        branches=branches,
+        is_initialized=True,
+    )
+
+
+def reset_graph_cache(
+    cache: CachedGraphState,
+    runtime: RuntimeContext,
+    prefix: PrefixPlan | None = None,
+) -> None:
+    """Reset the cached tensors for a new generation.
+    
+    This resets tensor VALUES but keeps the same tensor OBJECTS so that
+    CUDA graphs remain valid.
+    """
+    token_ids = runtime.constants
+    gen = cache.generation
+    
+    # Reset step_tokens to initial values
+    gen.step_tokens.fill_(token_ids.pad)
+    gen.step_tokens[0, 0, 0] = token_ids.bos
+    gen.step_tokens[0, 1, 0] = token_ids.pad
+    gen.step_tokens[1, 0, 0] = token_ids.zero
+    gen.step_tokens[1, 1, 0] = token_ids.pad
+    
+    # Reset audio_buf to ungenerated
+    gen.audio_buf.fill_(token_ids.ungenerated)
+    
+    # Copy prefix audio into buffer if provided
+    if prefix is not None:
+        delayed = delay_frames(prefix.aligned_tokens, runtime.audio_delays, token_ids.audio_pad).to(runtime.device)
+        gen.audio_buf[0, :, : delayed.shape[1]] = delayed
+        if cache.branches > 1:
+            gen.audio_buf[1:, :, : delayed.shape[1]] = delayed
+    
+    # Reset KV caches
+    gen.decode.transformer.reset()
+    gen.decode.depformer.reset()
 
 
 def _fill_audio_channels(
@@ -224,6 +339,7 @@ def _execute_transformer_graph(
         transformer_capture[0].replay()
     return transformer_capture, dep_captures
 
+
 def _execute_depformer_graph(
     stage: int,
     prev_audio: torch.Tensor,
@@ -267,16 +383,46 @@ def run_generation_loop(
     config: GenerationConfig,
     start_step: int = 0,
     logger: RuntimeLogger | None = None,
+    # NEW: Optional cached graph state for graph reuse
+    graph_cache: CachedGraphState | None = None,
 ) -> tuple[Optional[int], torch.Tensor]:
+    """Run the main generation loop.
+    
+    If graph_cache is provided and has captured graphs, they will be replayed
+    instead of recompiled, significantly speeding up generation.
+    
+    Args:
+        runtime: The runtime context
+        state: Fresh state machine state (MUST be fresh each call!)
+        generation: The generation state with tensors
+        config: Generation configuration
+        start_step: Step to start generation from (after prefix warmup)
+        logger: Optional logger
+        graph_cache: Optional cached graph state for graph reuse
+    """
     step_tokens = generation.step_tokens
     audio_buf = generation.audio_buf
     branches = step_tokens.shape[0]
     max_context = runtime.config.runtime.max_context_steps
     if max_context <= 0:
         raise ValueError("Runtime configuration must specify a positive max_context_steps")
-    positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
-    main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
-    aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    
+    # Use cached tensors if available, otherwise create new ones
+    if graph_cache is not None:
+        positions = graph_cache.positions
+        main_tokens = graph_cache.main_tokens
+        aux_tokens = graph_cache.aux_tokens
+        buffers = graph_cache.buffers
+        transformer_capture = graph_cache.transformer_capture
+        dep_captures = graph_cache.dep_captures
+    else:
+        positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+        main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+        aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+        buffers = _allocate_network_buffers(runtime, branches)
+        transformer_capture = None
+        dep_captures = None
+    
     cfg_active = config.cfg_scale != 1.0
     token_ids = runtime.constants
     delay_tensor = runtime.audio_delay_tensor
@@ -297,10 +443,8 @@ def run_generation_loop(
         sample_audio_logits_fn = sample_audio_logits
     transformer_step = runtime.transformer_step
     depformer_step = runtime.depformer_step
-    buffers = _allocate_network_buffers(runtime, branches)
     positions_view = positions.expand(branches, -1)
-    transformer_capture = None
-    dep_captures: list[dict] | None = None
+    
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     processed_steps = 0
@@ -322,7 +466,6 @@ def run_generation_loop(
                 step_tokens[1:, 1, 0] = token_ids.pad
             if transformer_needs_compiling or not use_graph:
                 if transformer_needs_compiling:
-                    # Must use -no-cudagraphs variant as we are manually using graphs too.
                     transformer_step = torch.compile(
                         runtime.transformer_step,
                         dynamic=True,
@@ -408,7 +551,6 @@ def run_generation_loop(
                             buffers=buffers,
                             capture=dep_captures[stage],
                         )
-
                 else:
                     _execute_depformer_stage(
                         stage_index=stage,
@@ -440,6 +582,11 @@ def run_generation_loop(
     if logger and processed_steps and processed_steps % report_interval != 0:
         logger.progress(processed_steps, max_context)
 
+    # Update the cache with captured graphs if provided
+    if graph_cache is not None:
+        graph_cache.transformer_capture = transformer_capture
+        graph_cache.dep_captures = dep_captures
+
     if first_word_frame is None:
         first_word_frame = start_step
     if last_step < start_step:
@@ -457,12 +604,21 @@ def decode_audio(runtime: RuntimeContext, tokens: torch.Tensor) -> torch.Tensor:
         pcm = runtime.mimi.decode(tokens.to(runtime.device))
         return pcm[0, 0]
 
+
 def warmup_with_prefix(
     runtime: RuntimeContext,
     plan: PrefixPlan,
     state: State,
     generation: GenerationState,
 ) -> int:
+    """Warm up the model with prefix audio.
+    
+    This runs the transformer through the prefix frames to build up the KV cache
+    without generating new tokens. The state machine is advanced with forced tokens.
+    
+    NOTE: This does NOT use CUDA graphs - it runs in eager mode. This is intentional
+    because the warmup is a one-time cost per generation and prefix length varies.
+    """
     step_tokens = generation.step_tokens
     model_state = generation.decode
     branches = step_tokens.shape[0]
@@ -497,10 +653,15 @@ def warmup_with_prefix(
                 step_tokens[1:, 1, 0] = runtime.constants.pad
 
     return max(plan.aligned_frames - 1, 0)
+
+
 __all__ = [
     "build_initial_state",
     "run_generation_loop",
     "decode_audio",
     "warmup_with_prefix",
     "GenerationState",
+    "CachedGraphState",
+    "create_graph_cache",
+    "reset_graph_cache",
 ]
