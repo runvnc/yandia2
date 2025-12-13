@@ -590,6 +590,8 @@ async def run_streaming_generation(
                 step_tokens[1:, 0, 0] = token_ids.zero
                 step_tokens[1:, 1, 0] = token_ids.pad
             
+            # Sync for accurate timing
+            torch.cuda.synchronize()
             t_step_start = time.perf_counter()
             
             # Transformer step
@@ -611,6 +613,7 @@ async def run_streaming_generation(
                     step_tokens, positions_view, gen_state, 
                     runtime.transformer_step, buffers
                 )
+            torch.cuda.synchronize()
             
             t_transformer_done = time.perf_counter()
             transformer_times.append(t_transformer_done - t_step_start)
@@ -643,6 +646,7 @@ async def run_streaming_generation(
             codebook_token = sample_audio_logits(masked_cb0, config.audio.temperature, config.audio.top_k)
             audio_buf[:, 0, t + 1] = codebook_token
             
+            torch.cuda.synchronize()
             t_depformer_start = time.perf_counter()
             
             # Depformer stages
@@ -686,6 +690,7 @@ async def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
+            torch.cuda.synchronize()
             t_depformer_done = time.perf_counter()
             depformer_times.append(t_depformer_done - t_depformer_start)
             
