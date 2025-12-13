@@ -9,5 +9,4 @@ whisper-timestamped>=1.14.2
 fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.9
-# Install moshi from git (PyPI version has outdated deps)
-moshi @ git+https://github.com/kyutai-labs/moshi.git#subdirectory=moshi
+sentencepiece>=0.2.0
