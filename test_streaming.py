@@ -16,6 +16,7 @@ Environment variables:
     VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
     PLAYER - Audio player command (default: auto-detect aplay/play)
     NO_DEPFORMER_GRAPHS - Set to "1" to disable depformer CUDA graphs
+    USE_TORCH_COMPILE - Set to "1" to enable torch.compile optimization
 """
 import asyncio
 import json
@@ -43,6 +44,7 @@ except ImportError:
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
 NO_DEPFORMER_GRAPHS = os.environ.get("NO_DEPFORMER_GRAPHS", "") == "1"
+USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "") == "1"
 
 # Derive WS_URL from SERVER_URL if not explicitly set
 if "WS_URL" in os.environ:
@@ -84,6 +86,8 @@ async def chat_loop():
     
     if NO_DEPFORMER_GRAPHS:
         print("*** DEPFORMER CUDA GRAPHS DISABLED ***")
+    if USE_TORCH_COMPILE:
+        print("*** TORCH.COMPILE ENABLED (first request will be slow due to compilation) ***")
     
     async with websockets.connect(WS_URL) as ws:
         # Wait for ready
@@ -111,11 +115,12 @@ async def chat_loop():
                 if not text.strip():
                     continue
                     
-                # Send text with optional depformer graph disable
+                # Send text with optional flags
                 request_data = {
                     "text": text,
                     "conversational": False,  # Default to non-conversational for speed
-                    "use_depformer_graphs": not NO_DEPFORMER_GRAPHS
+                    "use_depformer_graphs": not NO_DEPFORMER_GRAPHS,
+                    "use_torch_compile": USE_TORCH_COMPILE
                 }
                 await ws.send(json.dumps(request_data))
                 

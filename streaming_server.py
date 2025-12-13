@@ -422,6 +422,7 @@ async def run_streaming_generation(
     config: GenerationConfig,
     graph_cache: Optional[CachedGraphState],
     use_depformer_graphs: bool = True,
+    use_torch_compile: bool = False,
 ) -> AsyncGenerator[Tuple[bytes, bool], None]:
     """
     Generator that yields (audio_bytes, is_final) tuples as audio is generated.
@@ -545,6 +546,24 @@ async def run_streaming_generation(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     
+    # Optional torch.compile for optimized kernels
+    transformer_step = runtime.transformer_step
+    depformer_step = runtime.depformer_step
+    if use_torch_compile and runtime.device.type == "cuda":
+        print(f"[Compile] Compiling transformer_step and depformer_step (this may take 30-60s on first run)...")
+        compile_start = time.time()
+        transformer_step = torch.compile(
+            runtime.transformer_step,
+            dynamic=True,
+            mode="max-autotune-no-cudagraphs" if use_graph else "max-autotune",
+        )
+        depformer_step = torch.compile(
+            runtime.depformer_step,
+            dynamic=True,
+            mode="max-autotune-no-cudagraphs" if use_graph else "max-autotune",
+        )
+        print(f"[Compile] Compilation setup done in {time.time() - compile_start:.1f}s (actual compile on first use)")
+    
     delay_tensor = runtime.audio_delay_tensor
     positions_view = positions.expand(branches, -1)
     
@@ -602,7 +621,7 @@ async def run_streaming_generation(
                     positions_view=positions_view,
                     branches=branches,
                     generation=gen_state,
-                    transformer_step=runtime.transformer_step,
+                    transformer_step=transformer_step,
                     buffers=buffers,
                     transformer_capture=transformer_capture,
                     dep_captures=dep_captures,
@@ -613,7 +632,7 @@ async def run_streaming_generation(
                     print(f"[Graph] Transformer: using EAGER mode")
                 hidden_t = _execute_transformer_step(
                     step_tokens, positions_view, gen_state, 
-                    runtime.transformer_step, buffers
+                    transformer_step, buffers
                 )
             
             t_transformer_done = time.perf_counter()
@@ -668,7 +687,7 @@ async def run_streaming_generation(
                         prev_audio=prev_audio,
                         hidden_t=hidden_t,
                         generation=gen_state,
-                        depformer_step=runtime.depformer_step,
+                        depformer_step=depformer_step,
                         main_tokens=main_tokens,
                         aux_tokens=aux_tokens,
                         buffers=buffers,
@@ -684,7 +703,7 @@ async def run_streaming_generation(
                         prev_audio=prev_audio,
                         hidden_t=hidden_t,
                         generation=gen_state,
-                        depformer_step=runtime.depformer_step,
+                        depformer_step=depformer_step,
                         main_tokens=main_tokens,
                         second_tokens=aux_tokens,
                         buffers=buffers,
@@ -938,6 +957,11 @@ async def websocket_generate(websocket: WebSocket):
             if not use_depformer_graphs:
                 print(f"[WS] Depformer CUDA graphs DISABLED")
             
+            # Check for torch.compile flag
+            use_torch_compile = data.get("use_torch_compile", False)
+            if use_torch_compile:
+                print(f"[WS] torch.compile ENABLED")
+            
             # Stream audio chunks
             if use_original_loop == "dia_generate":
                 print(f"[WS] Using dia.generate() directly (diagnostic mode 2)")
@@ -954,7 +978,7 @@ async def websocket_generate(websocket: WebSocket):
                 )
             else:
                 generator = run_streaming_generation(
-                    runtime, text, prefix_s1, prefix_s2, prefix_plan, config, dia._graph_cache, use_depformer_graphs
+                    runtime, text, prefix_s1, prefix_s2, prefix_plan, config, dia._graph_cache, use_depformer_graphs, use_torch_compile
                 )
             
             audio_chunks = []
