@@ -70,7 +70,7 @@ class MimiCodec(nn.Module):
         *,
         device: torch.device,
         dtype: Optional[torch.dtype] = None,
-        num_codebooks: int = 8,
+        num_codebooks: int = 32,
     ) -> "MimiCodec":
         """Load the Kyutai Mimi model.
         
@@ -78,7 +78,7 @@ class MimiCodec(nn.Module):
             model_repo: HuggingFace repo containing Mimi weights (ignored - always uses moshiko repo)
             device: Device to load model on
             dtype: Data type (note: Kyutai Mimi manages its own dtype)
-            num_codebooks: Number of codebooks to use (default 8 for lower latency)
+            num_codebooks: Number of codebooks to use (default 32 - Mimi's max)
         """
         from huggingface_hub import hf_hub_download
         
