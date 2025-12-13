@@ -29,7 +29,7 @@ echo "3. Setting AI voice (this will transcribe - takes ~10-20s first time)..."
 cp example_prefix1.wav "$OUTDIR/00_ai_warmup.wav"
 echo "   Copied example_prefix1.wav -> $OUTDIR/00_ai_warmup.wav"
 time curl -s -X POST "$SERVER/set_voice" \
-  -F "file=@example_prefix1.wav" | python3 -m json.tool
+	-F "file=@example_prefix1.wav" | python3 -m json.tool
 echo ""
 
 # Simulate user speaking (using example_prefix2.wav as user audio)
@@ -37,16 +37,16 @@ echo "4. User spoke (this will transcribe - takes ~10-20s first time)..."
 cp example_prefix2.wav "$OUTDIR/01_user_spoke.wav"
 echo "   Copied example_prefix2.wav -> $OUTDIR/01_user_spoke.wav"
 time curl -s -X POST "$SERVER/user_spoke" \
-  -F "file=@example_prefix2.wav" | python3 -m json.tool
+	-F "file=@example_prefix2.wav" | python3 -m json.tool
 echo ""
 
 # Generate AI response
 echo "5. Generating AI response..."
 time curl -s -X POST "$SERVER/generate" \
-  -F "text=Hello! Thank you for calling. How can I help you today?" \
-  -F "cfg_scale=1.0" \
-  -F "temperature=0.8" \
-  --output "$OUTDIR/02_ai_response.wav"
+	-F "text=Hello! Thank you for calling. How can I help you today?" \
+	-F "cfg_scale=1.0" \
+	-F "temperature=0.8" \
+	--output "$OUTDIR/02_ai_response.wav"
 echo ""
 echo "   Output: $OUTDIR/02_ai_response.wav"
 
@@ -59,8 +59,8 @@ echo ""
 # Generate another response (user didn't speak, just AI continues)
 echo "7. Generating second AI response (no new user audio)..."
 time curl -s -X POST "$SERVER/generate" \
-  -F "text=I'm Mary from customer service. Are you calling about your account?" \
-  --output "$OUTDIR/03_ai_response.wav"
+	-F "text=I'm Bob from customer service. Are you calling about your account?" \
+	--output "$OUTDIR/03_ai_response.wav"
 echo ""
 echo "   Output: $OUTDIR/03_ai_response.wav"
 

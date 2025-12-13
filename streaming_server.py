@@ -433,7 +433,7 @@ async def run_streaming_generation(
     global _warmup_cache
     gen_start = time.time()
     # Streaming config
-    CHUNK_FRAMES = 2  # Decode every N frames after undelaying (reduced from 6 for lower latency)
+    CHUNK_FRAMES = 1  # Decode every frame for minimum latency
     
     token_ids = runtime.constants
     

@@ -1,8 +1,23 @@
 # Yandia2 Project Handoff Document
 
-**Last Updated**: December 12, 2025 (Evening Session)  
+**Last Updated**: December 13, 2025  
 **Project**: `/files/yandia2`  
-**GitHub**: `https://github.com/runvnc/yandia2`
+**GitHub**: `https://github.com/runvnc/yandia2`  
+**Current Tag**: `1s_new_streaming_ok`
+
+---
+
+## Executive Summary
+
+Yandia2 is a **Dia2 TTS conversation server** with **native Kyutai Mimi streaming** for low-latency audio output. The server maintains stateful conversations with voice cloning support.
+
+**Current Performance:**
+- First audio chunk: ~1.14s after generation starts
+- Total warmup: ~2.76s (prefix processing)
+- RTF (Real-Time Factor): ~0.96 (nearly real-time)
+- Audio generation: 2.16s audio in 2.07s
+
+**Key Achievement:** Integrated the original Kyutai Mimi codec (from moshi package) with native `StreamingModule` support, replacing the HuggingFace MimiModel.
 
 ---
 
@@ -10,351 +25,164 @@
 
 **Dia2 requires BOTH speaker prefixes for voice cloning to work!**
 
-When only `prefix_speaker_1` is provided (without `prefix_speaker_2`), Dia2 produces **random voices** instead of cloning the target voice. This is a quirk of the model, not a bug in our code.
+When only `prefix_speaker_1` is provided (without `prefix_speaker_2`), Dia2 produces **random voices** instead of cloning the target voice.
 
 **Fix:** When no user audio exists, fall back to the AI audio for speaker_2:
 ```python
 speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
 ```
 
-This fix is applied in both `conversation_server.py` and `streaming_server.py`.
-
 ---
 
-## Session Summary (Dec 12, 2025 Evening)
+## Architecture Overview
 
-### What We Debugged
+### Kyutai Mimi Integration
 
-Spent ~8 hours debugging "random voice" issue in streaming. Symptoms:
-- Voice cloning produced random voices instead of target voice
-- "Cut off sound" at beginning of audio
-- Issue appeared to be intermittent/hardware-related
+We replaced the HuggingFace `transformers.MimiModel` with the original **Kyutai Mimi** from the `moshi` package. This provides:
 
-### What We Tried (That Didn't Fix It)
-
-1. **Fresh venv** - Same issue
-2. **Fresh working directory** - Same issue  
-3. **New pod** - Same issue
-4. **Old git tags** (`working_rtf_1.6`, `working_conv_very_slow`) - Same issue!
-5. **Clearing CUDA cache** - Same issue
-6. **Checking for Dia2 caching** - No persistent cache found
-7. **Testing Mimi encode/decode round-trip** - Works fine
-8. **Diagnostic mode with original run_generation_loop** - Same issue
-9. **Diagnostic mode with dia.generate() directly** - Same issue!
-
-### The Root Cause
-
-**Dia2 requires BOTH speaker prefixes for voice cloning!**
-
-When only `prefix_speaker_1` is provided, the model produces random voices. This is a quirk of the Dia2 model, not our code.
-
-### The Fix
+1. **Native StreamingModule support** - Built-in state management for incremental decoding
+2. **CUDA graph optimization** - Automatic graph caching within the streaming context
+3. **Simpler API** - Just enter streaming context and call decode()
 
 ```python
-# If no user audio, fall back to AI audio for speaker_2
-speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+# Old HuggingFace approach (decode_streaming with past_key_values)
+audio, kv = mimi.decode(codes, decoder_past_key_values=kv, return_dict=True)
+
+# New Kyutai Mimi approach (native streaming)
+with mimi.streaming(batch_size=1):
+    audio = mimi.decode(codes)  # State managed automatically
 ```
 
-Applied in `streaming_server.py` and `conversation_server.py`.
+### Key Files
 
-### Current Status
+| File | Description |
+|------|-------------|
+| `dia2/audio/codec.py` | Kyutai Mimi wrapper with streaming support |
+| `dia2/audio/codec_hf.py` | Backup of HuggingFace implementation |
+| `streaming_server.py` | Main server with WebSocket streaming |
+| `conversation_server.py` | REST-only server (no streaming decode) |
 
-| Feature | Status |
-|---------|--------|
-| Voice cloning | ✅ Working |
-| Streaming | ✅ Working (RTF ~0.9) |
-| Audio artifact at start | ⚠️ Sometimes present |
-
-### Remaining Issue: Audio Artifact
-
-~50% of generations have a brief noise/partial speech at the very beginning. Possible causes:
-1. `content_start = start_step + 1` might need adjustment
-2. Codec boundary artifacts from chunk-by-chunk decoding
-3. Residual prefix audio leaking through
-
-**Potential fixes to try:**
-- Skip more frames: `content_start = start_step + 2` or `+ 3`
-- Larger CHUNK_FRAMES (fewer decode boundaries)
-- Add fade-in to mask artifact
-- Use streaming decode if available (current Mimi wrapper doesn't have it)
-
-### Key Commits This Session
-
-- `7387759` - FIX: Dia2 requires BOTH speaker prefixes
-- `1dc4270` - Apply fix to conversation_server.py
-- `58bd813` - Document finding in HANDOFF.md
-
----
-
-## Executive Summary
-
-Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching for faster generation.
-Now includes **WebSocket streaming** for low-latency audio output. It manages stateful conversations where:
-1. An AI voice warmup is set
-2. User audio is provided  
-3. Text is generated as speech using the conversation context
-
-**Current Performance**: ~5-6s total, RTF ~1.6 (1.6x slower than realtime)  
-**Target**: Streaming output for ~2-3s to first audio chunk
-
----
-
-## Project Structure
-
-```
-/files/yandia2/
-├── dia2/                      # Dia2 library (modified for graph caching)
-│   ├── engine.py              # Main Dia2 class with graph cache
-│   ├── runtime/
-│   │   ├── generator.py       # Generation loop + CachedGraphState
-│   │   ├── voice_clone.py     # Prefix/voice handling
-│   │   └── ...
-│   └── ...
-├── conversation_server.py     # FastAPI server (stateful conversation)
-├── streaming_server.py        # FastAPI server with WebSocket streaming ⭐ NEW
-├── simple_server.py           # FastAPI server (stateless)
-├── example_prefix1.wav        # Example AI voice (Speaker 1)
-├── example_prefix2.wav        # Example user voice (Speaker 2)
-├── test_conversation.sh       # Test script
-├── test_streaming.sh          # Test streaming script ⭐ NEW
-├── test_streaming.py          # Python WebSocket test client ⭐ NEW
-├── requirements.txt           # For pip install
-├── pyproject.toml             # For uv
-└── HANDOFF.md                 # This document
-```
-
----
-
-## Git Tags (Safe Restore Points)
-
-| Tag | Description |
-|-----|-------------|
-| `working_conv_very_slow` | Before graph caching (~10s, RTF ~2.5-3.0) |
-| `working_rtf_1.6` | With graph caching (~5-6s, RTF ~1.6) |
-| `streaming_v1` | With WebSocket streaming (~2-3s to first audio) |
-| `stream_clone_artifact` | Voice cloning works, minor artifact at start |
-
-```bash
-# To restore if something breaks:
-git checkout working_rtf_1.6
-```
-
----
-
-## API Endpoints (conversation_server.py / streaming_server.py)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Server status + conversation state |
-| `/reset` | POST | Reset conversation |
-| `/set_voice` | POST | Upload AI warmup audio (file) |
-| `/user_spoke` | POST | Upload user audio (file) |
-| `/generate` | POST | Generate AI speech from text |
-| `/ws/generate` | WebSocket | Stream audio chunks (streaming_server.py only) |
-| `/state` | GET | Get current conversation state |
-
-### Conversation Flow
-
-```
-1. POST /set_voice    [AI warmup audio]
-2. POST /user_spoke   [User audio]  
-3. POST /generate     {text: "Hello..."}  → Returns WAV
-4. POST /user_spoke   [Next user audio]
-5. POST /generate     {text: "..."}  → Returns WAV
-... repeat 4-5 ...
-```
-
-### Streaming Flow (WebSocket)
-
-```
-1. POST /set_voice         [AI warmup audio]
-2. POST /user_spoke        [User audio]  
-3. WebSocket /ws/generate  
-   → Client sends: {"text": "Hello..."}
-   → Server streams: binary audio chunks
-   → Server sends: {"event": "done", "duration": 1.5}
-```
-
----
-
-## Streaming Implementation ⭐ NEW
-
-The `streaming_server.py` adds WebSocket streaming capability for low-latency TTS.
-
-### How It Works
-
-1. **Warmup phase** (~1-2s) - Unavoidable, builds KV cache for prefix audio
-2. **Generation loop** - Generates tokens and decodes audio incrementally
-3. **Chunk streaming** - Every 3 frames (~125ms), decode and send audio
-4. **Mimi streaming** - Uses `decode_streaming()` to maintain decoder KV state
-
-### Key Design Decisions
-
-- **CHUNK_FRAMES = 3** - Decode every 3 frames for balance of latency vs overhead
-- **UNDELAY_FRAMES = 8** - Skip first 8 frames of audio (codec delay artifacts)
-- **Reuses CUDA graph cache** - Same graph caching as non-streaming version
-- **Fresh State each call** - State machine is always created fresh
-
-### WebSocket Protocol
+### Codec Architecture
 
 ```python
-# Client → Server
-{"text": "Hello world", "cfg_scale": 1.0, "temperature": 0.8, "top_k": 50}
-
-# Server → Client (events)
-{"event": "ready", "sample_rate": 24000}
-{"event": "generating"}
-{"event": "done", "duration": 1.5, "total_time": 2.3}
-
-# Server → Client (audio)
-Binary: [1 byte is_final flag] + [16-bit PCM samples]
-```
-
-### Expected Latency
-
-| Phase | Time |
-|-------|------|
-| Warmup (unavoidable) | ~1-2s |
-| First audio chunk | ~600-800ms after generation starts |
-| Subsequent chunks | ~100-150ms intervals |
-| **Total to first audio** | **~2-3s** |
-
----
-
-## Key Implementation Details
-
-### CUDA Graph Caching
-
-Graphs are cached at the `Dia2` instance level to avoid recompilation:
-
-```python
-# dia2/runtime/generator.py
-@dataclass
-class CachedGraphState:
-    generation: GenerationState  # Reused tensor objects
-    positions: torch.Tensor
-    main_tokens: torch.Tensor
-    aux_tokens: torch.Tensor
-    buffers: NetworkBuffers
-    transformer_capture: Optional[...]  # CUDA graphs
-    dep_captures: Optional[...]
-```
-
-**Critical**: Tensor OBJECTS must be reused (same memory addresses). Only reset VALUES with `.fill_()` or `.copy_()`.
-
-### State Machine (MUST be fresh each call)
-
-```python
-# dia2/engine.py generate()
-state = runtime.machine.new_state(entries)  # ALWAYS fresh!
-```
-
-The State tracks text entries to generate. If reused, causes "re-read prefix" bug.
-
-### Prefix Handling
-
-```python
-entries = []
-if prefix_plan:
-    entries.extend(prefix_plan.entries)  # Prefix entries first
-entries.extend(parse_script([text], ...))  # Then new text
-state = runtime.machine.new_state(entries)  # Single state with ALL
+# dia2/audio/codec.py
+class MimiCodec(nn.Module):
+    def start_streaming(self, batch_size=1):
+        self._streaming_context = self.model.streaming(batch_size)
+        self._streaming_context.__enter__()
+    
+    def stop_streaming(self):
+        self._streaming_context.__exit__(None, None, None)
+        self._streaming_context = None
+    
+    def decode(self, codes):
+        # In streaming mode, maintains internal KV state
+        return self.model.decode(codes)
 ```
 
 ---
 
-## Critical Bugs Fixed
+## Streaming Flow
 
-### 1. trim_audio Replacing Tensor (MAJOR)
+### WebSocket `/ws/generate` Endpoint
 
-**Bug**: `GenerationState.trim_audio()` replaced `self.audio_buf` with smaller tensor, breaking CUDA graph references.
-
-**Fix**: Return trimmed tensor without modifying `self.audio_buf`:
-```python
-def trim_audio(self, limit, pad_token, ungenerated):
-    trimmed = self.audio_buf[:, :, :limit]
-    pad = torch.full_like(trimmed, pad_token)
-    trimmed = torch.where(trimmed == ungenerated, pad, trimmed)
-    # DON'T DO: self.audio_buf = trimmed
-    return trimmed
+```
+1. Client connects to WebSocket
+2. Server enters Mimi streaming mode: mimi.start_streaming(batch_size=1)
+3. Warm up Mimi with prefix tokens (builds voice context in decoder KV cache)
+4. Generation loop:
+   a. Generate audio tokens (transformer + depformer)
+   b. Every CHUNK_FRAMES (3), decode tokens via Mimi streaming
+   c. Send PCM chunk to client via WebSocket
+5. Flush remaining frames
+6. Exit streaming mode: mimi.stop_streaming()
 ```
 
-### 2. PyTorch Compatibility (torch.backends.cudnn.conv)
-
-**Bug**: Older PyTorch doesn't have `torch.backends.cudnn.conv`
-
-**Fix**: Check with `hasattr()` before accessing.
-
-### 3. Single Speaker Prefix = Random Voice (MAJOR)
-
-**Bug**: When only `prefix_speaker_1` is provided to `dia.generate()` without `prefix_speaker_2`, the model produces random voices instead of cloning the target voice.
-
-**Symptoms**:
-- "Cut off sound at front" (partial prefix leaking)
-- "Random voice saying text" (voice conditioning not working)
-- Works fine when both speakers are provided
-
-**Fix**: Always provide both speaker prefixes. If no user audio, use AI audio for both:
-```python
-speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
-result = dia.generate(
-    text,
-    prefix_speaker_1=conversation.last_ai_audio,
-    prefix_speaker_2=speaker_2_audio,  # Fall back to AI audio!
-)
-```
-
-**Note**: This cost ~8 hours of debugging across multiple sessions. The issue manifested as intermittent "hardware problems" because previous tests happened to include both speakers.
-
----
-
-## Lessons from Failed Attempts (/files/stream-dia2)
-
-The stream-dia2 project has ~30 commits of failed fixes. Key lessons:
-
-1. **Use SINGLE state machine with ALL entries** - Separating prefix/generation state machines breaks voice consistency
-2. **Always run warmup_with_prefix()** - Builds KV cache, can't skip
-3. **Don't cache State object** - Only cache tensors
-4. **Don't replace tensor objects** - Breaks CUDA graphs
-5. **ALWAYS provide BOTH speaker prefixes** - Single speaker = random voice!
-
----
-
-## Performance Breakdown
-
-### Current (~5-6s total, RTF ~1.6)
+### Latency Breakdown
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| Transcription | ~1s | Cached after first call per file |
-| Prefix warmup | ~1-2s | Eager mode, varies with prefix length |
-| Graph compile | ~0.5s | Only first call, then ~0 |
-| Generation | ~2-3s | ~21 toks/s with graph replay |
-| Mimi decode | ~0.5s | Could be streamed |
-
-### Why Previous Experiments Showed 0.6 RTF
-
-The 0.6 RTF (faster than realtime) was measuring ONLY the generation loop after graphs were warm, not including warmup/decode/transcription.
+| Prefix warmup (transformer KV) | ~2.76s | Unavoidable, processes prefix audio |
+| First audio chunk | ~1.14s | After generation starts |
+| Subsequent chunks | ~80-150ms | Every 3 frames |
+| Total first audio | ~3.9s | warmup + first chunk |
 
 ---
 
-## Configuration
+## Optimization Opportunities
 
-### Defaults (conversation_server.py)
+### 1. Pre-warm During User Speech (High Impact)
 
-```python
-cfg_scale: float = Form(1.0)      # 1.0 = no CFG (faster), 2.0 = CFG (better quality)
-temperature: float = Form(0.8)
-top_k: int = Form(50)
-use_cuda_graph: bool = True       # In engine.py generate()
+The ~2.76s warmup happens AFTER the user finishes speaking. Could pre-warm:
+- Start prefix warmup as soon as user audio arrives
+- Run transcription in parallel with warmup
+- Have prefix ready when generation text arrives
+
+### 2. Cache Transcription Results (Already Done)
+
+Transcription results are cached by file hash. First transcription takes ~0.7-0.9s, subsequent calls hit cache.
+
+### 3. Reduce CHUNK_FRAMES (Trade-off)
+
+Currently decoding every 3 frames (~240ms of audio). Could reduce to 1-2 frames for lower latency but more decode overhead.
+
+### 4. Mimi Warmup Optimization
+
+Currently warming Mimi by decoding prefix tokens (discarding output). Could potentially:
+- Use smaller prefix (less warmup time)
+- Investigate if Mimi truly needs full prefix warmup for voice consistency
+
+### 5. Persistent Session with KV Snapshots
+
+The `stream-dia2` project explored KV cache snapshots to avoid per-request warmup. This is complex but could eliminate the 2.76s warmup for subsequent requests.
+
+---
+
+## Git Tags (Restore Points)
+
+| Tag | Description |
+|-----|-------------|
+| `1s_new_streaming_ok` | **CURRENT** - Kyutai Mimi native streaming, working |
+| `stream_clone_artifact` | Voice cloning works, minor artifact at start |
+| `working_rtf_1.6` | With CUDA graph caching (~5-6s, RTF ~1.6) |
+| `working_conv_very_slow` | Before graph caching (~10s, RTF ~2.5-3.0) |
+| `realtime_prebad_rnd_voice` | Before random voice fix |
+
+```bash
+# To restore if something breaks:
+git checkout 1s_new_streaming_ok
 ```
 
-### CFG Impact
+---
 
-| cfg_scale | Speed | Quality |
-|-----------|-------|--------|
-| 1.0 | ~21 toks/s | Good |
-| 2.0 | ~10 toks/s | Better (2x slower, runs model twice) |
+## Installation
+
+### Using install.sh (Recommended)
+
+```bash
+cd /files/yandia2
+./install.sh
+```
+
+This installs dependencies and handles the moshi package separately (due to version conflicts).
+
+### Manual Installation
+
+```bash
+# Install main dependencies
+pip install -r requirements.txt
+
+# Install moshi from git with --no-deps (has version conflicts)
+pip install --no-deps git+https://github.com/kyutai-labs/moshi.git#subdirectory=moshi
+```
+
+### Dependencies Note
+
+The `moshi` package has strict version constraints that conflict with yandia2's requirements:
+- moshi requires `torch<2.8` but we need `torch>=2.8.0`
+- moshi requires `sphn<0.2.0` but we need `sphn>=0.2.0`
+
+We use `--no-deps` and manage dependencies manually, or use uv's `override-dependencies` feature.
 
 ---
 
@@ -362,40 +190,117 @@ use_cuda_graph: bool = True       # In engine.py generate()
 
 ```bash
 cd /files/yandia2
-
-# Non-streaming server:
-cd /files/yandia2
-
-# With uv:
-uv sync
-uv run python conversation_server.py
-
-# With pip:
-pip install -r requirements.txt
-python conversation_server.py
-
-# Or with uvicorn:
-uvicorn conversation_server:app --host 0.0.0.0 --port 8000
-
-# Streaming server:
-uv run python streaming_server.py
-# or
-uvicorn streaming_server:app --host 0.0.0.0 --port 8000
+python streaming_server.py  # Runs on port 3030
 ```
 
-### Testing
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Server status + conversation state |
+| `/reset` | POST | Reset conversation |
+| `/set_voice` | POST | Upload AI warmup audio (file) |
+| `/user_spoke` | POST | Upload user audio (file) |
+| `/generate` | POST | Generate AI speech (REST, complete audio) |
+| `/ws/generate` | WebSocket | Stream audio chunks (native Mimi streaming) |
+| `/state` | GET | Get current conversation state |
+
+---
+
+## Testing
+
+### Test REST Endpoints
 
 ```bash
-# Non-streaming:
-SERVER=http://localhost:8000 ./test_conversation.sh
-
-# Streaming:
-chmod +x test_streaming.sh
-./test_streaming.sh
-
-# Or manually:
-python test_streaming.py "Hello, this is a test."
+./test_conversation.sh
 ```
+
+Tests: /health, /reset, /set_voice, /user_spoke, /generate (REST), /state
+
+### Test WebSocket Streaming
+
+```bash
+./test_streaming.sh
+# or
+python test_streaming.py "Hello, this is a streaming test."
+```
+
+Tests the WebSocket `/ws/generate` endpoint with native Mimi streaming.
+
+### Expected Log Output (Streaming)
+
+```
+[Stream] Warming up with prefix (112 frames)...
+[Stream] Warmup done in 2.76s
+[Stream] Starting generation loop from step 111...
+[Stream] max_delay=18, num_codebooks=32
+[Stream] content_start=112 (will decode from here)
+[Stream] First chunk sent after 1.14s
+[Stream] Generation complete: 2.16s audio in 2.07s (RTF: 0.96)
+```
+
+---
+
+## Reverting to HuggingFace Mimi
+
+If the Kyutai Mimi integration causes issues, you can revert to the HuggingFace implementation:
+
+```bash
+cp dia2/audio/codec_hf.py dia2/audio/codec.py
+```
+
+Note: The HuggingFace version doesn't have native streaming support, so the streaming server will use chunk-by-chunk batch decoding instead.
+
+---
+
+## Project Structure
+
+```
+/files/yandia2/
+├── dia2/                      # Dia2 library (modified for yandia2)
+│   ├── audio/
+│   │   ├── codec.py           # Kyutai Mimi wrapper (native streaming)
+│   │   ├── codec_hf.py        # HuggingFace backup
+│   │   └── grid.py            # Audio frame utilities
+│   ├── engine.py              # Main Dia2 class
+│   └── runtime/
+│       ├── generator.py       # Generation loop + CUDA graphs
+│       ├── voice_clone.py     # Prefix/voice handling
+│       └── ...
+├── streaming_server.py        # Main server (REST + WebSocket streaming)
+├── conversation_server.py     # REST-only server
+├── install.sh                 # Installation script
+├── requirements.txt           # Dependencies
+├── test_conversation.sh       # REST endpoint tests
+├── test_streaming.sh          # WebSocket streaming test
+├── test_streaming.py          # Python streaming client
+├── example_prefix1.wav        # Example AI voice
+├── example_prefix2.wav        # Example user voice
+└── HANDOFF.md                 # This document
+```
+
+---
+
+## Key Learnings
+
+### 1. Moshi vs HuggingFace Mimi
+
+- **HuggingFace `transformers.MimiModel`**: Port of Mimi, uses `decoder_past_key_values` for streaming
+- **Kyutai Mimi (moshi package)**: Original implementation with `StreamingModule` pattern
+- The weights format is different! Kyutai expects weights from `kyutai/moshiko-pytorch-bf16`, not `kyutai/mimi`
+
+### 2. Codebook Count
+
+- Mimi has 32 codebooks total
+- Dia2 uses a delay pattern that requires access to all of them
+- Must set `num_codebooks=32` (we initially tried 8, then 16, both failed)
+
+### 3. API Compatibility
+
+The new codec needed to maintain backwards compatibility:
+- `encode()` returns tuple `(codes, None)` to match HuggingFace API
+- `decode()` returns same tensor format
+- Added `return_dict` parameter (ignored) for compatibility
 
 ---
 
@@ -403,46 +308,22 @@ python test_streaming.py "Hello, this is a test."
 
 - **Use case**: Employment verification phone calls via SIP
 - **Current TTS**: ElevenLabs (~150-200ms latency)
-- **Goal**: Replace with self-hosted Dia2
+- **Goal**: Replace with self-hosted Dia2 for cost savings
 - **Constraint**: Need low latency for natural conversation
-- **Related projects**:
-  - `mr_eleven_stream` - ElevenLabs streaming with µ-law output
-  - `mr_sip` - SIP call handling
-  - `stream-dia2` - Previous streaming attempts (many failed)
 
 ---
 
-## µ-law Output (For SIP Integration)
+## Related Projects
 
-Adding µ-law output won't speed up generation but is useful for SIP integration:
-
-```python
-import audioop
-
-def pcm_to_ulaw(pcm_24khz: bytes) -> bytes:
-    # Resample 24kHz → 8kHz
-    pcm_8khz, _ = audioop.ratecv(pcm_24khz, 2, 1, 24000, 8000, None)
-    # Convert to µ-law
-    ulaw = audioop.lin2ulaw(pcm_8khz, 2)
-    return ulaw
-```
+| Project | Path | Description |
+|---------|------|-------------|
+| stream-dia2 | `/files/stream-dia2` | Previous streaming experiments (150+ commits) |
+| moshi | `/files/moshi` | Kyutai Moshi/Mimi library |
+| mr_eleven_stream | `/xfiles/upd5/mr_eleven_stream` | ElevenLabs streaming plugin |
+| mr_sip | `/xfiles/update_plugins/mr_sip` | SIP call handling |
 
 ---
 
-## Files Modified from Original Dia2
+## Contact
 
-| File | Changes |
-|------|------|
-| `dia2/engine.py` | Added `_graph_cache`, `use_graph_cache` param, `clear_graph_cache()` |
-| `dia2/runtime/generator.py` | Added `CachedGraphState`, `create_graph_cache()`, `reset_graph_cache()`, fixed `trim_audio()` |
-| `dia2/runtime/context.py` | Fixed PyTorch compatibility for `cudnn.conv` |
-| `streaming_server.py` | New file: WebSocket streaming server |
-| `test_streaming.py` | New file: WebSocket test client |
-
----
-
-## Contact / Resources
-
-- **Dia2 Original**: https://github.com/nari-labs/dia2
-- **Dia2 HuggingFace**: `nari-labs/Dia2-2B`
-- **This Project**: https://github.com/runvnc/yandia2
+User (runvnc) has extensive context on this project and can clarify requirements.
