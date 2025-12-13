@@ -15,6 +15,7 @@ Environment variables:
     WS_URL - WebSocket URL (default: ws://localhost:3030/ws/generate)
     VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
     PLAYER - Audio player command (default: auto-detect aplay/play)
+    NO_DEPFORMER_GRAPHS - Set to "1" to disable depformer CUDA graphs
 """
 import asyncio
 import json
@@ -41,6 +42,7 @@ except ImportError:
 # Configurable via environment variables
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
+NO_DEPFORMER_GRAPHS = os.environ.get("NO_DEPFORMER_GRAPHS", "") == "1"
 
 # Derive WS_URL from SERVER_URL if not explicitly set
 if "WS_URL" in os.environ:
@@ -80,6 +82,9 @@ async def chat_loop():
     """Interactive chat loop with streaming audio playback."""
     print(f"\nConnecting to {WS_URL}...")
     
+    if NO_DEPFORMER_GRAPHS:
+        print("*** DEPFORMER CUDA GRAPHS DISABLED ***")
+    
     async with websockets.connect(WS_URL) as ws:
         # Wait for ready
         msg = await ws.recv()
@@ -106,11 +111,13 @@ async def chat_loop():
                 if not text.strip():
                     continue
                     
-                # Send text
-                await ws.send(json.dumps({
+                # Send text with optional depformer graph disable
+                request_data = {
                     "text": text,
-                    "conversational": False  # Default to non-conversational for speed
-                }))
+                    "conversational": False,  # Default to non-conversational for speed
+                    "use_depformer_graphs": not NO_DEPFORMER_GRAPHS
+                }
+                await ws.send(json.dumps(request_data))
                 
                 # Start player process
                 player = None
