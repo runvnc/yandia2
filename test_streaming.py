@@ -3,25 +3,26 @@ import os
 """Test client for the streaming Dia2 server.
 
 Usage:
-    python test_streaming.py [text]
+    python test_streaming.py
 
-Examples:
-    python test_streaming.py "Hello, this is a test of streaming TTS."
-    python test_streaming.py  # Uses default text
+Features:
+    - Interactive chat loop
+    - Real-time audio playback (requires 'aplay' or 'sox')
+    - Persistent WebSocket connection
 
 Environment variables:
     SERVER_URL - HTTP server URL (default: http://localhost:3030)
     WS_URL - WebSocket URL (default: ws://localhost:3030/ws/generate)
     VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
-    USE_ORIGINAL_LOOP - Set to "1" to use diagnostic mode with original generation loop
-    USE_DIA_GENERATE - Set to "1" to use diagnostic mode with dia.generate() directly
+    PLAYER - Audio player command (default: auto-detect aplay/play)
 """
 import asyncio
 import json
 import sys
 import time
-import wave
 import struct
+import shutil
+import subprocess
 from pathlib import Path
 
 try:
@@ -40,8 +41,6 @@ except ImportError:
 # Configurable via environment variables
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
-USE_ORIGINAL_LOOP = os.environ.get("USE_ORIGINAL_LOOP", "") == "1"
-USE_DIA_GENERATE = os.environ.get("USE_DIA_GENERATE", "") == "1"
 
 # Derive WS_URL from SERVER_URL if not explicitly set
 if "WS_URL" in os.environ:
@@ -54,11 +53,19 @@ else:
         WS_URL = "ws://" + SERVER_URL[7:] + "/ws/generate"
 
 
+def get_audio_player_cmd(sample_rate=24000):
+    """Get command to play raw PCM audio from stdin."""
+    if shutil.which("aplay"):
+        return ["aplay", "-r", str(sample_rate), "-f", "S16_LE", "-c", "1", "-t", "raw"]
+    elif shutil.which("play"):
+        # sox
+        return ["play", "-r", str(sample_rate), "-b", "16", "-c", "1", "-e", "signed-integer", "-t", "raw", "-"]
+    return None
+
 
 async def setup_voice(server_url: str, voice_file: str):
     """Upload voice warmup file."""
     print(f"Setting voice from: {voice_file}")
-    # Use longer timeout for Whisper transcription (can take 30-60s on first run)
     async with httpx.AsyncClient(timeout=120.0) as client:
         with open(voice_file, "rb") as f:
             response = await client.post(
@@ -69,8 +76,8 @@ async def setup_voice(server_url: str, voice_file: str):
         print(f"Voice set: {response.json()}")
 
 
-async def stream_tts(text: str, output_file: str = "streaming_output.wav"):
-    """Stream TTS and save to file."""
+async def chat_loop():
+    """Interactive chat loop with streaming audio playback."""
     print(f"\nConnecting to {WS_URL}...")
     
     async with websockets.connect(WS_URL) as ws:
@@ -82,117 +89,109 @@ async def stream_tts(text: str, output_file: str = "streaming_output.wav"):
         if data.get("error"):
             print(f"Error: {data['error']}")
             return
-        
-        # Send config if using original loop
-        if USE_DIA_GENERATE:
-            print("\n*** DIAGNOSTIC MODE 2: Using dia.generate() directly ***\n")
-            await ws.send(json.dumps({"type": "config", "use_dia_generate": True}))
-        elif USE_ORIGINAL_LOOP:
-            print("\n*** DIAGNOSTIC MODE 1: Using original generation loop ***\n")
-            await ws.send(json.dumps({"type": "config", "use_original_loop": True}))
-        else:
-            print("\n*** STREAMING MODE: Using custom streaming loop ***\n")
-        
+            
         sample_rate = data.get("sample_rate", 24000)
+        player_cmd = get_audio_player_cmd(sample_rate)
         
-        # Send text
-        print(f"\nSending: {text}")
-        await ws.send(json.dumps({"text": text}))
-        
-        # Receive generating event
-        msg = await ws.recv()
-        data = json.loads(msg)
-        print(f"Server: {data}")
-        
-        # Collect audio chunks
-        audio_chunks = []
-        start_time = time.time()
-        first_chunk_time = None
-        chunk_count = 0
+        if player_cmd:
+            print(f"Audio playback enabled using: {' '.join(player_cmd)}")
+        else:
+            print("Warning: No audio player found (aplay/sox). Audio will not be played.")
+
+        print("\n=== Ready! Type your text and press Enter (Ctrl+C to exit) ===")
         
         while True:
-            msg = await ws.recv()
-            
-            if isinstance(msg, bytes):
-                # Binary audio chunk
-                is_final = struct.unpack("!?", msg[:1])[0]
-                audio_data = msg[1:]
-                audio_chunks.append(audio_data)
-                chunk_count += 1
+            try:
+                text = await asyncio.get_event_loop().run_in_executor(None, input, "\nYou: ")
+                if not text.strip():
+                    continue
+                    
+                # Send text
+                await ws.send(json.dumps({
+                    "text": text,
+                    "conversational": False  # Default to non-conversational for speed
+                }))
                 
-                if first_chunk_time is None:
-                    first_chunk_time = time.time() - start_time
-                    print(f"First chunk received after {first_chunk_time:.2f}s ({len(audio_data)} bytes)")
-                else:
-                    print(f"Chunk {chunk_count}: {len(audio_data)} bytes, final={is_final}")
+                # Start player process
+                player = None
+                if player_cmd:
+                    player = subprocess.Popen(
+                        player_cmd, 
+                        stdin=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL
+                    )
                 
-            else:
-                # JSON message
-                data = json.loads(msg)
-                print(f"Server: {data}")
+                # Receive loop
+                start_time = time.time()
+                first_chunk = True
                 
-                if data.get("event") == "done":
-                    break
-                elif data.get("error"):
-                    print(f"Error: {data['error']}")
-                    break
-        
-        total_time = time.time() - start_time
-        
-        # Save audio
-        if audio_chunks:
-            all_audio = b"".join(audio_chunks)
-            samples = len(all_audio) // 2
-            duration = samples / sample_rate
-            
-            with wave.open(output_file, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(sample_rate)
-                wav.writeframes(all_audio)
-            
-            print(f"\n=== Results ===")
-            print(f"Output saved to: {output_file}")
-            print(f"Audio duration: {duration:.2f}s")
-            print(f"Total time: {total_time:.2f}s")
-            print(f"Time to first chunk: {first_chunk_time:.2f}s")
-            print(f"RTF: {total_time/duration:.2f}")
-            print(f"Chunks received: {chunk_count}")
-        else:
-            print("No audio received!")
+                while True:
+                    msg = await ws.recv()
+                    
+                    if isinstance(msg, bytes):
+                        # Binary audio chunk
+                        # is_final = struct.unpack("!?", msg[:1])[0]
+                        audio_data = msg[1:]
+                        
+                        if first_chunk:
+                            latency = time.time() - start_time
+                            print(f"[Latency: {latency:.3f}s] Playing...", end="", flush=True)
+                            first_chunk = False
+                        else:
+                            print(".", end="", flush=True)
+                            
+                        if player:
+                            player.stdin.write(audio_data)
+                            player.stdin.flush()
+                        
+                    else:
+                        # JSON message
+                        data = json.loads(msg)
+                        if data.get("event") == "done":
+                            print(f" Done ({data.get('duration', 0):.2f}s)")
+                            break
+                        elif data.get("event") == "generating":
+                            print("Generating...", end=" ", flush=True)
+                        elif data.get("error"):
+                            print(f"\nError: {data['error']}")
+                            break
+                
+                if player:
+                    player.stdin.close()
+                    player.wait()
+                    
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"\nError: {e}")
+                break
 
 
 async def main():
-    # Check if server is running
+    # Check server health
     try:
-        # Use longer timeout for initial health check too
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{SERVER_URL}/health")
             health = response.json()
-            print(f"Server health: {health}")
     except Exception as e:
         print(f"Could not connect to server at {SERVER_URL}: {e}")
-        print("Make sure the server is running: python streaming_server.py")
         return
     
-    # Setup voice if not initialized
+    # Setup voice if needed
     if not health.get("conversation", {}).get("initialized"):
         voice_file = Path(__file__).parent / VOICE_FILE
         if not voice_file.exists():
             print(f"Voice file not found: {voice_file}")
-            print("Please provide a voice warmup file.")
             return
         await setup_voice(SERVER_URL, str(voice_file))
     
-    # Get text from command line or use default
-    if len(sys.argv) > 1:
-        text = " ".join(sys.argv[1:])
-    else:
-        text = "Hello! This is a test of the streaming text to speech system. I hope you can hear me clearly."
-    
-    # Stream TTS
-    await stream_tts(text)
+    await chat_loop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nGoodbye!")

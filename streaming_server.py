@@ -77,6 +77,7 @@ _transcription_cache = {}
 @dataclass
 class ConversationState:
     """Tracks the current conversation state."""
+    initial_ai_audio: Optional[str] = None
     last_ai_audio: Optional[str] = None
     last_user_audio: Optional[str] = None
     turn_count: int = 0
@@ -215,6 +216,7 @@ async def set_voice(file: UploadFile = File(...)):
     
     print(f"[Dia2] AI voice set: {voice_path} ({len(content)} bytes)")
     
+    conversation.initial_ai_audio = str(voice_path)
     conversation.last_ai_audio = str(voice_path)
     conversation.is_initialized = True
     conversation.turn_count = 0
@@ -434,10 +436,12 @@ async def run_streaming_generation(
     # Warmup with prefix (builds KV cache) - this part can't be streamed
     start_step = 0
     if prefix_plan is not None:
-        print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)...")
+        print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)... ")
         warmup_start = time.time()
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-        print(f"[Stream] Warmup done in {time.time() - warmup_start:.2f}s")
+        warmup_time = time.time() - warmup_start
+        print(f"[Stream] Warmup done in {warmup_time:.4f}s")
+        print(f"[Stream] Time to generation start: {time.time() - gen_start:.4f}s")
     
     # Note: We use regular decode() for each chunk instead of streaming decode
     # The HuggingFace MimiModel doesn't have decode_streaming, but chunk-by-chunk
@@ -488,7 +492,7 @@ async def run_streaming_generation(
     print(f"[Stream] Starting generation loop from step {start_step}...")
     print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
     print(f"[Stream] content_start={content_start} (will decode from here)")
-    gen_start = time.time()
+    loop_start = time.time()
     first_chunk_sent = False
     last_step = start_step - 1
     
@@ -637,7 +641,7 @@ async def run_streaming_generation(
                     
                     if not first_chunk_sent:
                         first_chunk_sent = True
-                        print(f"[Stream] First chunk sent after {time.time() - gen_start:.2f}s")
+                        print(f"[Stream] First chunk sent after {time.time() - loop_start:.4f}s (Total: {time.time() - gen_start:.4f}s)")
                     
                     yield (pcm16, False)
                 
@@ -679,7 +683,7 @@ async def run_streaming_generation(
         graph_cache.transformer_capture = transformer_capture
         graph_cache.dep_captures = dep_captures
     
-    total_time = time.time() - gen_start
+    total_time = time.time() - loop_start
     duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
     print(f"[Stream] Generation complete: {duration:.2f}s audio in {total_time:.2f}s (RTF: {total_time/max(duration, 0.01):.2f})")
 
@@ -735,6 +739,7 @@ async def websocket_generate(websocket: WebSocket):
             if data.get("type") == "config":
                 use_original_loop = data.get("use_original_loop", False)
                 use_dia_generate = data.get("use_dia_generate", False)
+                # conversational = data.get("conversational", False) # Handled per request below if needed, or global config
                 print(f"[WS] Config: use_original_loop={use_original_loop}, use_dia_generate={use_dia_generate}")
                 if use_dia_generate:
                     use_original_loop = "dia_generate"  # Special flag
@@ -751,6 +756,7 @@ async def websocket_generate(websocket: WebSocket):
             
             # Get config from request
             cfg_scale = data.get("cfg_scale", 1.0)
+            conversational = data.get("conversational", False)  # Default to False (non-conversational)
             temperature = data.get("temperature", 0.8)
             top_k = data.get("top_k", 50)
             
@@ -761,20 +767,29 @@ async def websocket_generate(websocket: WebSocket):
                 use_cuda_graph=True,
             )
             
-            # Build prefix plan - IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
-            # If no user audio, fall back to AI audio for speaker_2
-            speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+            # Determine prefixes based on mode
+            if conversational:
+                # Conversational mode: Use history
+                prefix_s1 = conversation.last_ai_audio
+                prefix_s2 = conversation.last_user_audio or conversation.last_ai_audio
+                print(f"[WS] Mode: Conversational")
+            else:
+                # Non-conversational (default): Use initial AI voice for both
+                # This ensures consistent voice and faster response (cached transcription)
+                prefix_s1 = conversation.initial_ai_audio
+                prefix_s2 = conversation.initial_ai_audio
+                print(f"[WS] Mode: Single-turn (using initial AI voice)")
             
             prefix_config = PrefixConfig(
-                speaker_1=conversation.last_ai_audio,
-                speaker_2=speaker_2_audio,
+                speaker_1=prefix_s1,
+                speaker_2=prefix_s2,
             )
             prefix_plan = build_prefix_plan(runtime, prefix_config)
             
             print(f"\n[WS] === Turn {conversation.turn_count} ===")
             print(f"[WS] Generating: {text}")
-            print(f"[WS] AI prefix: {conversation.last_ai_audio}")
-            print(f"[WS] User prefix: {conversation.last_user_audio}")
+            print(f"[WS] AI prefix: {prefix_s1}")
+            print(f"[WS] S2 prefix: {prefix_s2}")
             
             # Send generating event
             await websocket.send_text(json.dumps({"event": "generating"}))
@@ -819,14 +834,15 @@ async def websocket_generate(websocket: WebSocket):
                 samples = len(all_audio) // 2  # 16-bit = 2 bytes per sample
                 duration = samples / dia.sample_rate
                 
-                # Save as conversation state
-                ai_output_path = CONV_DIR / f"ai_turn_{conversation.turn_count}.wav"
-                _save_pcm_wav(all_audio, dia.sample_rate, str(ai_output_path))
-                
-                conversation.last_ai_audio = str(ai_output_path)
-                conversation.turn_count += 1
-                
-                print(f"[WS] Saved AI audio: {ai_output_path}")
+                # Only update conversation state if in conversational mode
+                if conversational:
+                    ai_output_path = CONV_DIR / f"ai_turn_{conversation.turn_count}.wav"
+                    _save_pcm_wav(all_audio, dia.sample_rate, str(ai_output_path))
+                    conversation.last_ai_audio = str(ai_output_path)
+                    conversation.turn_count += 1
+                    print(f"[WS] Saved AI audio: {ai_output_path}")
+                else:
+                    print(f"[WS] Single-turn mode: Audio not saved to conversation history")
             else:
                 duration = 0
             
@@ -883,74 +899,74 @@ def _tensor_to_wav(waveform: torch.Tensor, sample_rate: int) -> bytes:
 
 
 # Also keep the non-streaming generate endpoint for compatibility
-@app.post("/generate")
-async def generate(
-    text: str = Form(...),
-    cfg_scale: float = Form(1.0),
-    temperature: float = Form(0.8),
-    top_k: int = Form(50),
-):
-    """Non-streaming generate endpoint (same as conversation_server.py)."""
-    global conversation
-    
-    if dia is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    if not conversation.is_initialized:
-        raise HTTPException(status_code=400, detail="Conversation not initialized. Call /set_voice first.")
-    
-    if not text.strip().startswith("[S1]"):
-        text = f"[S1] {text}"
-    
-    config = GenerationConfig(
-        cfg_scale=cfg_scale,
-        audio=SamplingConfig(temperature=temperature, top_k=top_k),
-        text=SamplingConfig(temperature=0.6, top_k=50),
-        use_cuda_graph=True,
-    )
-    
-    print(f"\n[Dia2] === Turn {conversation.turn_count} ===")
-    print(f"[Dia2] Generating: {text}")
-    
-    start = time.time()
-    
-    try:
-        # IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
-        # If no user audio, fall back to AI audio for speaker_2
-        speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
-        
-        result = dia.generate(
-            text,
-            config=config,
-            prefix_speaker_1=conversation.last_ai_audio,
-            prefix_speaker_2=speaker_2_audio,
-            verbose=True,
-        )
-        
-        elapsed = time.time() - start
-        duration = result.waveform.shape[-1] / result.sample_rate
-        print(f"[Dia2] Generated {duration:.2f}s audio in {elapsed:.2f}s (RTF: {elapsed/duration:.2f})")
-        
-        ai_output_path = CONV_DIR / f"ai_turn_{conversation.turn_count}.wav"
-        wav_bytes = _tensor_to_wav(result.waveform, result.sample_rate)
-        ai_output_path.write_bytes(wav_bytes)
-        
-        conversation.last_ai_audio = str(ai_output_path)
-        conversation.turn_count += 1
-        
-        return Response(
-            content=wav_bytes,
-            media_type="audio/wav",
-            headers={
-                "X-Audio-Duration": str(duration),
-                "X-Turn-Count": str(conversation.turn_count),
-            }
-        )
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.post("/generate")
+# async def generate(
+#     text: str = Form(...),
+#     cfg_scale: float = Form(1.0),
+#     temperature: float = Form(0.8),
+#     top_k: int = Form(50),
+# ):
+#     """Non-streaming generate endpoint (same as conversation_server.py)."""
+#     global conversation
+#     
+#     if dia is None:
+#         raise HTTPException(status_code=503, detail="Model not loaded")
+#     
+#     if not conversation.is_initialized:
+#         raise HTTPException(status_code=400, detail="Conversation not initialized. Call /set_voice first.")
+#     
+#     if not text.strip().startswith("[S1]"):
+#         text = f"[S1] {text}"
+#     
+#     config = GenerationConfig(
+#         cfg_scale=cfg_scale,
+#         audio=SamplingConfig(temperature=temperature, top_k=top_k),
+#         text=SamplingConfig(temperature=0.6, top_k=50),
+#         use_cuda_graph=True,
+#     )
+#     
+#     print(f"\n[Dia2] === Turn {conversation.turn_count} ===")
+#     print(f"[Dia2] Generating: {text}")
+#     
+#     start = time.time()
+#     
+#     try:
+#         # IMPORTANT: Dia2 needs BOTH speakers for voice cloning!
+#         # If no user audio, fall back to AI audio for speaker_2
+#         speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+#         
+#         result = dia.generate(
+#             text,
+#             config=config,
+#             prefix_speaker_1=conversation.last_ai_audio,
+#             prefix_speaker_2=speaker_2_audio,
+#             verbose=True,
+#         )
+#         
+#         elapsed = time.time() - start
+#         duration = result.waveform.shape[-1] / result.sample_rate
+#         print(f"[Dia2] Generated {duration:.2f}s audio in {elapsed:.2f}s (RTF: {elapsed/duration:.2f})")
+#         
+#         ai_output_path = CONV_DIR / f"ai_turn_{conversation.turn_count}.wav"
+#         wav_bytes = _tensor_to_wav(result.waveform, result.sample_rate)
+#         ai_output_path.write_bytes(wav_bytes)
+#         
+#         conversation.last_ai_audio = str(ai_output_path)
+#         conversation.turn_count += 1
+#         
+#         return Response(
+#             content=wav_bytes,
+#             media_type="audio/wav",
+#             headers={
+#                 "X-Audio-Duration": str(duration),
+#                 "X-Turn-Count": str(conversation.turn_count),
+#             }
+#         )
+#         
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/state")
