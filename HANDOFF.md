@@ -1,6 +1,6 @@
 # Yandia2 Project Handoff Document
 
-**Date**: December 12, 2025  
+**Last Updated**: December 12, 2025 (Evening Session)  
 **Project**: `/files/yandia2`  
 **GitHub**: `https://github.com/runvnc/yandia2`
 
@@ -18,6 +18,71 @@ speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
 ```
 
 This fix is applied in both `conversation_server.py` and `streaming_server.py`.
+
+---
+
+## Session Summary (Dec 12, 2025 Evening)
+
+### What We Debugged
+
+Spent ~8 hours debugging "random voice" issue in streaming. Symptoms:
+- Voice cloning produced random voices instead of target voice
+- "Cut off sound" at beginning of audio
+- Issue appeared to be intermittent/hardware-related
+
+### What We Tried (That Didn't Fix It)
+
+1. **Fresh venv** - Same issue
+2. **Fresh working directory** - Same issue  
+3. **New pod** - Same issue
+4. **Old git tags** (`working_rtf_1.6`, `working_conv_very_slow`) - Same issue!
+5. **Clearing CUDA cache** - Same issue
+6. **Checking for Dia2 caching** - No persistent cache found
+7. **Testing Mimi encode/decode round-trip** - Works fine
+8. **Diagnostic mode with original run_generation_loop** - Same issue
+9. **Diagnostic mode with dia.generate() directly** - Same issue!
+
+### The Root Cause
+
+**Dia2 requires BOTH speaker prefixes for voice cloning!**
+
+When only `prefix_speaker_1` is provided, the model produces random voices. This is a quirk of the Dia2 model, not our code.
+
+### The Fix
+
+```python
+# If no user audio, fall back to AI audio for speaker_2
+speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+```
+
+Applied in `streaming_server.py` and `conversation_server.py`.
+
+### Current Status
+
+| Feature | Status |
+|---------|--------|
+| Voice cloning | ✅ Working |
+| Streaming | ✅ Working (RTF ~0.9) |
+| Audio artifact at start | ⚠️ Sometimes present |
+
+### Remaining Issue: Audio Artifact
+
+~50% of generations have a brief noise/partial speech at the very beginning. Possible causes:
+1. `content_start = start_step + 1` might need adjustment
+2. Codec boundary artifacts from chunk-by-chunk decoding
+3. Residual prefix audio leaking through
+
+**Potential fixes to try:**
+- Skip more frames: `content_start = start_step + 2` or `+ 3`
+- Larger CHUNK_FRAMES (fewer decode boundaries)
+- Add fade-in to mask artifact
+- Use streaming decode if available (current Mimi wrapper doesn't have it)
+
+### Key Commits This Session
+
+- `7387759` - FIX: Dia2 requires BOTH speaker prefixes
+- `1dc4270` - Apply fix to conversation_server.py
+- `58bd813` - Document finding in HANDOFF.md
 
 ---
 
@@ -67,6 +132,7 @@ Now includes **WebSocket streaming** for low-latency audio output. It manages st
 | `working_conv_very_slow` | Before graph caching (~10s, RTF ~2.5-3.0) |
 | `working_rtf_1.6` | With graph caching (~5-6s, RTF ~1.6) |
 | `streaming_v1` | With WebSocket streaming (~2-3s to first audio) |
+| `stream_clone_artifact` | Voice cloning works, minor artifact at start |
 
 ```bash
 # To restore if something breaks:
