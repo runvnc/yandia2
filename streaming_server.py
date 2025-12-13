@@ -568,6 +568,9 @@ async def run_streaming_generation(
     depformer_times = []
     decode_times = []
     
+    # Log every step
+    print(f"[Profile] Step timing (step, transformer_ms, depformer_ms, cumulative_ms):")
+    
     # Enable Mimi streaming mode
     with torch.inference_mode(), runtime.mimi.streaming(batch_size=1):
         for offset in range(max_context):
@@ -686,6 +689,10 @@ async def run_streaming_generation(
             t_depformer_done = time.perf_counter()
             depformer_times.append(t_depformer_done - t_depformer_start)
             
+            cumulative = (time.perf_counter() - loop_start) * 1000
+            trans_ms = transformer_times[-1] * 1000
+            dep_ms = depformer_times[-1] * 1000
+            print(f"[Step {offset:3d}] t={t:4d} trans={trans_ms:6.2f}ms dep={dep_ms:6.2f}ms cumul={cumulative:8.2f}ms")
             # Check for EOS
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -722,6 +729,7 @@ async def run_streaming_generation(
                 t_decode_done = time.perf_counter()
                 decode_times.append(t_decode_done - t_decode_start)
                 waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
+                print(f"[Decode] frames={frames_to_decode} decode_ms={decode_times[-1]*1000:.2f}ms")
                 
                 if waveform.shape[0] > 0:
                     pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
