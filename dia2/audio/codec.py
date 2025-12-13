@@ -19,7 +19,10 @@ from moshi.models import get_mimi
 from moshi.models.compression import MimiModel as KyutaiMimiModel
 
 
-DEFAULT_MIMI_MODEL_ID = "kyutai/mimi"
+# Default model repo and weights file for Kyutai Mimi
+# Note: The moshi library expects weights from moshiko repo, not kyutai/mimi
+DEFAULT_MIMI_REPO = "kyutai/moshiko-pytorch-bf16"
+DEFAULT_MIMI_WEIGHTS = "tokenizer-e351c8d8-checkpoint125.safetensors"
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ class MimiCodec(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        model_id: str = DEFAULT_MIMI_MODEL_ID,
+        model_repo: str = DEFAULT_MIMI_REPO,
         *,
         device: torch.device,
         dtype: Optional[torch.dtype] = None,
@@ -72,15 +75,16 @@ class MimiCodec(nn.Module):
         """Load the Kyutai Mimi model.
         
         Args:
-            model_id: HuggingFace model ID (used to download weights)
+            model_repo: HuggingFace repo containing Mimi weights
             device: Device to load model on
             dtype: Data type (note: Kyutai Mimi manages its own dtype)
             num_codebooks: Number of codebooks to use (default 8 for Dia2)
         """
         from huggingface_hub import hf_hub_download
         
-        # Download the weights from HuggingFace
-        weights_path = hf_hub_download(model_id, "model.safetensors")
+        # Download the weights from HuggingFace (moshiko repo has the correct format)
+        weights_path = hf_hub_download(model_repo, DEFAULT_MIMI_WEIGHTS)
+        print(f"[MimiCodec] Loading weights from {weights_path}")
         
         # Load using Kyutai's get_mimi function
         model = get_mimi(
