@@ -27,7 +27,7 @@ DEFAULT_MIMI_WEIGHTS = "tokenizer-e351c8d8-checkpoint125.safetensors"
 
 @dataclass(frozen=True)
 class MimiConfig:
-    model_id: str = DEFAULT_MIMI_MODEL_ID
+    model_repo: str = DEFAULT_MIMI_REPO
     dtype: Optional[torch.dtype] = None
 
 
