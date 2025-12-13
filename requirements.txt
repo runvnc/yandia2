@@ -10,3 +10,6 @@ fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.9
 sentencepiece>=0.2.0
+# moshi dependencies (needed because we install moshi with --no-deps)
+einops>=0.6.0
+aiohttp>=3.8.0
