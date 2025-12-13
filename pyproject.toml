@@ -32,8 +32,10 @@ dev = [
 
 [tool.uv]
 # Override moshi's torch<2.8 constraint to allow newer torch
+# and sphn<0.2.0 constraint to allow newer sphn
 override-dependencies = [
   "torch>=2.8.0",
+  "sphn>=0.2.0",
 ]
 package = true
 
