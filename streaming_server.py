@@ -562,6 +562,12 @@ async def run_streaming_generation(
     first_chunk_sent = False
     last_step = start_step - 1
     
+    # Detailed profiling
+    step_times = []
+    transformer_times = []
+    depformer_times = []
+    decode_times = []
+    
     # Enable Mimi streaming mode
     with torch.inference_mode(), runtime.mimi.streaming(batch_size=1):
         for offset in range(max_context):
@@ -580,6 +586,8 @@ async def run_streaming_generation(
             if branches > 1:
                 step_tokens[1:, 0, 0] = token_ids.zero
                 step_tokens[1:, 1, 0] = token_ids.pad
+            
+            t_step_start = time.perf_counter()
             
             # Transformer step
             if use_graph:
@@ -600,6 +608,9 @@ async def run_streaming_generation(
                     step_tokens, positions_view, gen_state, 
                     runtime.transformer_step, buffers
                 )
+            
+            t_transformer_done = time.perf_counter()
+            transformer_times.append(t_transformer_done - t_step_start)
             
             # Text sampling
             guided_text = apply_classifier_guidance(
@@ -628,6 +639,8 @@ async def run_streaming_generation(
             masked_cb0 = mask_audio_logits(guided_cb0, token_ids.audio_pad, token_ids.audio_bos)
             codebook_token = sample_audio_logits(masked_cb0, config.audio.temperature, config.audio.top_k)
             audio_buf[:, 0, t + 1] = codebook_token
+            
+            t_depformer_start = time.perf_counter()
             
             # Depformer stages
             prev_audio = codebook_token.expand(branches)
@@ -670,6 +683,9 @@ async def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
+            t_depformer_done = time.perf_counter()
+            depformer_times.append(t_depformer_done - t_depformer_start)
+            
             # Check for EOS
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -698,8 +714,13 @@ async def run_streaming_generation(
                 
                 chunk_tokens = torch.clamp(chunk_tokens, 0, 2047)
                 
+                t_decode_start = time.perf_counter()
+                
                 # Decode chunk
                 pcm = runtime.mimi.decode(chunk_tokens)
+                
+                t_decode_done = time.perf_counter()
+                decode_times.append(t_decode_done - t_decode_start)
                 waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
                 
                 if waveform.shape[0] > 0:
@@ -709,6 +730,17 @@ async def run_streaming_generation(
                     if not first_chunk_sent:
                         first_chunk_sent = True
                         print(f"[Stream] First chunk sent after {time.time() - loop_start:.4f}s (Total: {time.time() - gen_start:.4f}s)")
+                    
+                        # Print detailed timing for first chunk
+                        steps_for_first = len(transformer_times)
+                        print(f"[Profile] Steps to first chunk: {steps_for_first}")
+                        if transformer_times:
+                            print(f"[Profile] Transformer: avg={sum(transformer_times)/len(transformer_times)*1000:.2f}ms, total={sum(transformer_times)*1000:.2f}ms")
+                        if depformer_times:
+                            print(f"[Profile] Depformer: avg={sum(depformer_times)/len(depformer_times)*1000:.2f}ms, total={sum(depformer_times)*1000:.2f}ms")
+                        if decode_times:
+                            print(f"[Profile] Decode: avg={sum(decode_times)/len(decode_times)*1000:.2f}ms, total={sum(decode_times)*1000:.2f}ms")
+                        print(f"[Profile] First {min(5, len(transformer_times))} transformer steps (ms): {[f'{t*1000:.2f}' for t in transformer_times[:5]]}")
                     
                     yield (pcm16, False)
                 
@@ -753,6 +785,14 @@ async def run_streaming_generation(
     total_time = time.time() - loop_start
     duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
     print(f"[Stream] Generation complete: {duration:.2f}s audio in {total_time:.2f}s (RTF: {total_time/max(duration, 0.01):.2f})")
+    
+    # Final profiling summary
+    if transformer_times:
+        print(f"[Profile] Final - Transformer: avg={sum(transformer_times)/len(transformer_times)*1000:.2f}ms over {len(transformer_times)} steps")
+    if depformer_times:
+        print(f"[Profile] Final - Depformer: avg={sum(depformer_times)/len(depformer_times)*1000:.2f}ms over {len(depformer_times)} steps")
+    if decode_times:
+        print(f"[Profile] Final - Decode: avg={sum(decode_times)/len(decode_times)*1000:.2f}ms over {len(decode_times)} calls")
 
 
 @app.websocket("/ws/generate")
