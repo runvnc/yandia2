@@ -558,7 +558,7 @@ async def run_streaming_generation(
     print(f"[Stream] Starting generation loop from step {start_step}...")
     print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
     print(f"[Stream] content_start={content_start} (will decode from here)")
-    loop_start = time.time()
+    loop_start = time.perf_counter()
     first_chunk_sent = False
     last_step = start_step - 1
     
@@ -737,7 +737,7 @@ async def run_streaming_generation(
                     
                     if not first_chunk_sent:
                         first_chunk_sent = True
-                        print(f"[Stream] First chunk sent after {time.time() - loop_start:.4f}s (Total: {time.time() - gen_start:.4f}s)")
+                        print(f"[Stream] First chunk sent after {time.perf_counter() - loop_start:.4f}s (Total: {time.time() - gen_start:.4f}s)")
                     
                         # Print detailed timing for first chunk
                         steps_for_first = len(transformer_times)
@@ -790,7 +790,7 @@ async def run_streaming_generation(
         graph_cache.transformer_capture = transformer_capture
         graph_cache.dep_captures = dep_captures
     
-    total_time = time.time() - loop_start
+    total_time = time.perf_counter() - loop_start
     duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
     print(f"[Stream] Generation complete: {duration:.2f}s audio in {total_time:.2f}s (RTF: {total_time/max(duration, 0.01):.2f})")
     
