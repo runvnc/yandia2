@@ -410,6 +410,7 @@ async def run_streaming_generation(
     This is the core streaming logic - it runs the generation loop and yields
     audio chunks incrementally instead of waiting for full generation.
     """
+    gen_start = time.time()
     # Streaming config
     CHUNK_FRAMES = 6  # Decode every N frames after undelaying
     
