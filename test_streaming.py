@@ -10,8 +10,8 @@ Examples:
     python test_streaming.py  # Uses default text
 
 Environment variables:
-    SERVER_URL - HTTP server URL (default: http://localhost:8000)
-    WS_URL - WebSocket URL (default: ws://localhost:8000/ws/generate)
+    SERVER_URL - HTTP server URL (default: http://localhost:3030)
+    WS_URL - WebSocket URL (default: ws://localhost:3030/ws/generate)
     VOICE_FILE - Path to voice warmup file (default: example_prefix1.wav)
     USE_ORIGINAL_LOOP - Set to "1" to use diagnostic mode with original generation loop
     USE_DIA_GENERATE - Set to "1" to use diagnostic mode with dia.generate() directly
@@ -38,7 +38,7 @@ except ImportError:
 
 
 # Configurable via environment variables
-SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
 VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
 USE_ORIGINAL_LOOP = os.environ.get("USE_ORIGINAL_LOOP", "") == "1"
 USE_DIA_GENERATE = os.environ.get("USE_DIA_GENERATE", "") == "1"

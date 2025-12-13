@@ -3,7 +3,7 @@
 # Run this from the yandia2 directory
 
 # Default to localhost, override with: SERVER=https://your-url ./test_conversation.sh
-SERVER="${SERVER:-http://localhost:8000}"
+SERVER="${SERVER:-http://localhost:3030}"
 OUTDIR="/tmp/dia2_conversation"
 
 echo "=== Testing Dia2 Conversation Server ==="

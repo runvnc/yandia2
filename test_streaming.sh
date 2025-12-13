@@ -2,10 +2,10 @@
 # Test the streaming Dia2 server
 #
 # Environment variables:
-#   SERVER_URL - Server URL (default: http://localhost:8000)
+#   SERVER_URL - Server URL (default: http://localhost:3030)
 #   VOICE_FILE - Voice warmup file (default: example_prefix1.wav)
 
-export SERVER_URL=${SERVER_URL:-http://localhost:8000}
+export SERVER_URL=${SERVER_URL:-http://localhost:3030}
 export VOICE_FILE=${VOICE_FILE:-example_prefix1.wav}
 
 echo "Testing Dia2 Streaming Server at $SERVER_URL"
