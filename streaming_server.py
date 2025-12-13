@@ -440,7 +440,7 @@ async def run_streaming_generation(
     
     # Check if we can reuse warmup state
     # Key depends on prefix audio paths
-    prefix_key = f"{prefix_plan.speaker_1}:{prefix_plan.speaker_2}" if prefix_plan else "None"
+    prefix_key = f"{prefix_s1}:{prefix_s2}"
     
     is_warmed_up = False
     if _warmup_cache is not None and _warmup_cache.prefix_key == prefix_key and graph_cache is not None:
