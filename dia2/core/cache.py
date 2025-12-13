@@ -37,6 +37,9 @@ class CacheSlot:
     def reset(self) -> None:
         self.length.zero_()
 
+    def rewind(self, length: int) -> None:
+        self.length.fill_(length)
+
     # Due to many CacheSlot instances being used in a model, we disable
     # compilation for this method to avoid excessive compile times.
     @torch.compiler.disable
@@ -102,6 +105,10 @@ class KVCache:
     def reset(self) -> None:
         for slot in self.slots:
             slot.reset()
+
+    def rewind(self, length: int) -> None:
+        for slot in self.slots:
+            slot.rewind(length)
 
     clear = reset
 

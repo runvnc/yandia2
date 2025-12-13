@@ -64,6 +64,10 @@ class GenerationState:
     def reset_dep_cache(self) -> None:
         self.decode.depformer.reset()
 
+    def rewind(self, length: int) -> None:
+        self.decode.transformer.rewind(length)
+        self.decode.depformer.rewind(length)
+
 
 @dataclass
 class NetworkBuffers:
@@ -238,6 +242,20 @@ def reset_graph_cache(
     gen.decode.transformer.reset()
     gen.decode.depformer.reset()
 
+
+def rewind_graph_cache(
+    cache: CachedGraphState,
+    step: int,
+    step_tokens_snapshot: torch.Tensor,
+) -> None:
+    """Rewind the cached state to a specific step (post-warmup)."""
+    gen = cache.generation
+    
+    # Rewind KV caches
+    gen.rewind(step)
+    
+    # Restore step_tokens
+    gen.step_tokens.copy_(step_tokens_snapshot)
 
 def _fill_audio_channels(
     step_tokens: torch.Tensor,
@@ -667,4 +685,5 @@ __all__ = [
     "CachedGraphState",
     "create_graph_cache",
     "reset_graph_cache",
+    "rewind_graph_cache",
 ]
