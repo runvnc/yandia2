@@ -75,14 +75,20 @@ class MimiCodec(nn.Module):
         """Load the Kyutai Mimi model.
         
         Args:
-            model_repo: HuggingFace repo containing Mimi weights
+            model_repo: HuggingFace repo containing Mimi weights (ignored - always uses moshiko repo)
             device: Device to load model on
             dtype: Data type (note: Kyutai Mimi manages its own dtype)
             num_codebooks: Number of codebooks to use (default 8 for Dia2)
         """
         from huggingface_hub import hf_hub_download
         
-        # Download the weights from HuggingFace (moshiko repo has the correct format)
+        # Always use the moshiko repo - the moshi get_mimi() function requires weights
+        # in a specific format that only exists in the moshiko repo
+        # (The 'kyutai/mimi' repo has weights in HuggingFace format which is incompatible)
+        if model_repo != DEFAULT_MIMI_REPO:
+            print(f"[MimiCodec] Note: Ignoring repo '{model_repo}', using '{DEFAULT_MIMI_REPO}' for Kyutai Mimi")
+            model_repo = DEFAULT_MIMI_REPO
+        
         weights_path = hf_hub_download(model_repo, DEFAULT_MIMI_WEIGHTS)
         print(f"[MimiCodec] Loading weights from {weights_path}")
         
