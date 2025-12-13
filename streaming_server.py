@@ -542,7 +542,11 @@ async def run_streaming_generation(
     
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
     
-    use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
+    # Note: torch.compile and manual CUDA graphs conflict - can't capture compiled functions
+    # When torch.compile is enabled, disable manual CUDA graphs (torch.compile manages its own optimizations)
+    use_graph = config.use_cuda_graph and runtime.device.type == "cuda" and not use_torch_compile
+    if use_torch_compile and config.use_cuda_graph:
+        print(f"[Graph] Manual CUDA graphs disabled (torch.compile manages optimizations)")
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     
@@ -555,12 +559,12 @@ async def run_streaming_generation(
         transformer_step = torch.compile(
             runtime.transformer_step,
             dynamic=True,
-            mode="max-autotune-no-cudagraphs" if use_graph else "max-autotune",
+            mode="max-autotune",  # Let torch.compile manage cudagraphs internally
         )
         depformer_step = torch.compile(
             runtime.depformer_step,
             dynamic=True,
-            mode="max-autotune-no-cudagraphs" if use_graph else "max-autotune",
+            mode="max-autotune",  # Let torch.compile manage cudagraphs internally
         )
         print(f"[Compile] Compilation setup done in {time.time() - compile_start:.1f}s (actual compile on first use)")
     
