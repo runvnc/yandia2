@@ -6,6 +6,21 @@
 
 ---
 
+## ⚠️ CRITICAL: Dual Speaker Prefix Requirement
+
+**Dia2 requires BOTH speaker prefixes for voice cloning to work!**
+
+When only `prefix_speaker_1` is provided (without `prefix_speaker_2`), Dia2 produces **random voices** instead of cloning the target voice. This is a quirk of the model, not a bug in our code.
+
+**Fix:** When no user audio exists, fall back to the AI audio for speaker_2:
+```python
+speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+```
+
+This fix is applied in both `conversation_server.py` and `streaming_server.py`.
+
+---
+
 ## Executive Summary
 
 Yandia2 is a **working Dia2 TTS conversation server** with CUDA graph caching for faster generation.
@@ -204,6 +219,27 @@ def trim_audio(self, limit, pad_token, ungenerated):
 
 **Fix**: Check with `hasattr()` before accessing.
 
+### 3. Single Speaker Prefix = Random Voice (MAJOR)
+
+**Bug**: When only `prefix_speaker_1` is provided to `dia.generate()` without `prefix_speaker_2`, the model produces random voices instead of cloning the target voice.
+
+**Symptoms**:
+- "Cut off sound at front" (partial prefix leaking)
+- "Random voice saying text" (voice conditioning not working)
+- Works fine when both speakers are provided
+
+**Fix**: Always provide both speaker prefixes. If no user audio, use AI audio for both:
+```python
+speaker_2_audio = conversation.last_user_audio or conversation.last_ai_audio
+result = dia.generate(
+    text,
+    prefix_speaker_1=conversation.last_ai_audio,
+    prefix_speaker_2=speaker_2_audio,  # Fall back to AI audio!
+)
+```
+
+**Note**: This cost ~8 hours of debugging across multiple sessions. The issue manifested as intermittent "hardware problems" because previous tests happened to include both speakers.
+
 ---
 
 ## Lessons from Failed Attempts (/files/stream-dia2)
@@ -214,6 +250,7 @@ The stream-dia2 project has ~30 commits of failed fixes. Key lessons:
 2. **Always run warmup_with_prefix()** - Builds KV cache, can't skip
 3. **Don't cache State object** - Only cache tensors
 4. **Don't replace tensor objects** - Breaks CUDA graphs
+5. **ALWAYS provide BOTH speaker prefixes** - Single speaker = random voice!
 
 ---
 
