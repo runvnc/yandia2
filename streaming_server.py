@@ -416,6 +416,8 @@ async def run_generation_with_original_loop(
 async def run_streaming_generation(
     runtime,
     text: str,
+    prefix_s1: Optional[str],
+    prefix_s2: Optional[str],
     prefix_plan: Optional[PrefixPlan],
     config: GenerationConfig,
     graph_cache: Optional[CachedGraphState],
@@ -881,7 +883,7 @@ async def websocket_generate(websocket: WebSocket):
                 )
             else:
                 generator = run_streaming_generation(
-                    runtime, text, prefix_plan, config, dia._graph_cache
+                    runtime, text, prefix_s1, prefix_s2, prefix_plan, config, dia._graph_cache
                 )
             
             audio_chunks = []
