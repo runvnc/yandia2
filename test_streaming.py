@@ -89,7 +89,15 @@ async def chat_loop():
     if USE_TORCH_COMPILE:
         print("*** TORCH.COMPILE ENABLED (first request will be slow due to compilation) ***")
     
-    async with websockets.connect(WS_URL) as ws:
+    # Increase timeouts for torch.compile which can take 30-120 seconds
+    ws_timeout = 300 if USE_TORCH_COMPILE else 60  # 5 minutes for compile, 1 min otherwise
+    
+    async with websockets.connect(
+        WS_URL,
+        ping_timeout=ws_timeout,
+        ping_interval=30,
+        close_timeout=10
+    ) as ws:
         # Wait for ready
         msg = await ws.recv()
         data = json.loads(msg)
@@ -136,6 +144,7 @@ async def chat_loop():
                 # Receive loop
                 start_time = time.time()
                 first_chunk = True
+                compiling = False
                 
                 while True:
                     msg = await ws.recv()
@@ -147,7 +156,10 @@ async def chat_loop():
                         
                         if first_chunk:
                             latency = time.time() - start_time
-                            print(f"[Latency: {latency:.3f}s] Playing...", end="", flush=True)
+                            if compiling:
+                                print(f"\n[Compilation + Generation: {latency:.1f}s] Playing...", end="", flush=True)
+                            else:
+                                print(f"[Latency: {latency:.3f}s] Playing...", end="", flush=True)
                             first_chunk = False
                         else:
                             print(".", end="", flush=True)
@@ -163,7 +175,13 @@ async def chat_loop():
                             print(f" Done ({data.get('duration', 0):.2f}s)")
                             break
                         elif data.get("event") == "generating":
-                            print("Generating...", end=" ", flush=True)
+                            if compiling:
+                                print("\nCompilation done! Generating...", end=" ", flush=True)
+                            else:
+                                print("Generating...", end=" ", flush=True)
+                        elif data.get("event") == "compiling":
+                            compiling = True
+                            print(f"Compiling kernels (this may take 30-120s on first run)...", end=" ", flush=True)
                         elif data.get("error"):
                             print(f"\nError: {data['error']}")
                             break

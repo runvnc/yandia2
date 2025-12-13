@@ -966,6 +966,13 @@ async def websocket_generate(websocket: WebSocket):
             if use_torch_compile:
                 print(f"[WS] torch.compile ENABLED")
             
+            # If torch.compile is enabled, send status before potentially long compilation
+            if use_torch_compile:
+                await websocket.send_text(json.dumps({
+                    "event": "compiling",
+                    "message": "Compiling optimized kernels (first request only, may take 30-120s)..."
+                }))
+            
             # Stream audio chunks
             if use_original_loop == "dia_generate":
                 print(f"[WS] Using dia.generate() directly (diagnostic mode 2)")
