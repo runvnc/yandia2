@@ -31,6 +31,10 @@ dev = [
 ]
 
 [tool.uv]
+# Override moshi's torch<2.8 constraint to allow newer torch
+override-dependencies = [
+  "torch>=2.8.0",
+]
 package = true
 
 [tool.uv.sources]
