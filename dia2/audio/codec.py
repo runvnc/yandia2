@@ -154,7 +154,7 @@ class MimiCodec(nn.Module):
             audio = self.model.decode(codes)
             return torch.clamp(audio, -1.0, 1.0)
 
-    def encode(self, audio: torch.Tensor, *, return_dict: bool = False) -> torch.Tensor:
+    def encode(self, audio: torch.Tensor, *, return_dict: bool = False):
         """Encode audio waveform to codes.
         
         Args:
@@ -162,13 +162,14 @@ class MimiCodec(nn.Module):
             return_dict: Ignored, kept for backwards compatibility with HuggingFace API
             
         Returns:
-            Audio codes of shape [B, K, T]
-            (If return_dict was True, this would return a tuple but we just return codes
-             since Kyutai Mimi doesn't use return_dict)
+            Tuple of (codes, scale) to match HuggingFace API.
+            codes: Audio codes of shape [B, K, T]
+            scale: Always None (kept for compatibility)
         """
         audio = audio.to(self.device)
         with torch.inference_mode():
-            return self.model.encode(audio)
+            codes = self.model.encode(audio)
+            return (codes, None)  # Return tuple to match HuggingFace API
 
 
 class _StreamingContext:
