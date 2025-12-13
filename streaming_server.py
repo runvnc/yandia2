@@ -1,4 +1,4 @@
-"""Dia2 Streaming Conversation Server
+"""Dia2 Streaming Conversation Server with Kyutai Mimi Native Streaming
 
 Extends conversation_server.py with WebSocket streaming for low-latency TTS.
 
@@ -9,9 +9,9 @@ Flow:
 
 Expected latency:
 - Warmup (unavoidable): ~1-2s
-- First audio chunk: ~600-800ms after generation starts
+- First audio chunk: ~300-500ms after generation starts (with Mimi streaming)
 - Subsequent chunks: ~150-250ms intervals
-- Total to first audio: ~2-3s
+- Total to first audio: ~1.5-2.5s
 """
 import os
 import tempfile

@@ -16,6 +16,8 @@ dependencies = [
   "sphn>=0.2.0",
   "soundfile>=0.12.1",
   "whisper-timestamped>=1.14.2",
+  # Kyutai Mimi for native streaming
+  "moshi>=0.2.0",
   # Server dependencies
   "fastapi>=0.115.0",
   "uvicorn>=0.32.0",
