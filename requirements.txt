@@ -1,6 +1,5 @@
 torch>=2.8.0
 numpy>=2.1.0,<3.0
-# Pin transformers to version compatible with moshi's huggingface-hub<0.34 requirement
 transformers>=4.43.0,<4.44.0
 safetensors==0.5.3
 huggingface-hub>=0.24.7,<0.34
@@ -10,4 +9,5 @@ whisper-timestamped>=1.14.2
 fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.9
-moshi>=0.2.0
+# Install moshi from git (PyPI version has outdated deps)
+moshi @ git+https://github.com/kyutai-labs/moshi.git#subdirectory=moshi
