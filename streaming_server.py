@@ -20,6 +20,7 @@ import hashlib
 import struct
 import json
 import asyncio
+import copy
 from pathlib import Path
 from typing import Optional, AsyncGenerator, Tuple
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ from dia2.runtime.generator import (
     CachedGraphState,
     create_graph_cache,
     reset_graph_cache,
+    rewind_graph_cache,
     _allocate_network_buffers,
     _ensure_graph_cublas_ready,
     _fill_audio_channels,
@@ -50,6 +52,7 @@ from dia2.runtime.generator import (
     _execute_depformer_stage,
     _execute_depformer_graph,
 )
+from dia2.runtime.state_machine import State
 from dia2.audio.grid import undelay_frames
 from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
@@ -73,6 +76,15 @@ CONV_DIR.mkdir(exist_ok=True)
 # Transcription cache
 _transcription_cache = {}
 
+# Warmup cache for persistent sessions
+@dataclass
+class WarmupCache:
+    prefix_key: str  # Hash or identifier of the prefix configuration
+    start_step: int
+    state_snapshot: State
+    step_tokens_snapshot: torch.Tensor
+
+_warmup_cache: Optional[WarmupCache] = None
 
 @dataclass
 class ConversationState:
@@ -187,6 +199,7 @@ async def health():
 @app.post("/reset")
 async def reset_conversation():
     """Reset the conversation state."""
+    global _warmup_cache
     global conversation
     
     for f in CONV_DIR.glob("*.wav"):
@@ -197,6 +210,9 @@ async def reset_conversation():
     # Clear graph cache for fresh start
     if dia is not None:
         dia.clear_graph_cache()
+        
+    # Clear warmup cache
+    _warmup_cache = None
     
     print("[Dia2] Conversation reset")
     return {"status": "ok", "message": "Conversation reset"}
@@ -410,39 +426,86 @@ async def run_streaming_generation(
     This is the core streaming logic - it runs the generation loop and yields
     audio chunks incrementally instead of waiting for full generation.
     """
+    global _warmup_cache
     gen_start = time.time()
     # Streaming config
     CHUNK_FRAMES = 6  # Decode every N frames after undelaying
     
     token_ids = runtime.constants
     
-    # Build entries from prefix + new text
-    entries = []
-    if prefix_plan is not None:
-        entries.extend(prefix_plan.entries)
-    entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+    # Parse text entries
+    text_entries = parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate)
     
     runtime.machine.initial_padding = config.initial_padding
     
-    # Create FRESH state machine - critical!
-    state = runtime.machine.new_state(entries)
+    # Check if we can reuse warmup state
+    # Key depends on prefix audio paths
+    prefix_key = f"{prefix_plan.speaker_1}:{prefix_plan.speaker_2}" if prefix_plan else "None"
     
-    # Setup generation state
-    if graph_cache is not None:
-        reset_graph_cache(graph_cache, runtime, prefix_plan)
+    is_warmed_up = False
+    if _warmup_cache is not None and _warmup_cache.prefix_key == prefix_key and graph_cache is not None:
+        print(f"[Stream] Using cached warmup state (key={prefix_key})")
+        
+        # Restore state
+        start_step = _warmup_cache.start_step
+        state = copy.deepcopy(_warmup_cache.state_snapshot)
+        state.entries.extend(text_entries)
+        
+        # Rewind graph cache
+        rewind_graph_cache(graph_cache, start_step, _warmup_cache.step_tokens_snapshot)
         gen_state = graph_cache.generation
+        
+        is_warmed_up = True
     else:
-        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        print(f"[Stream] Full warmup required (key={prefix_key})")
+        
+        # Create FRESH state machine
+        full_entries = []
+        if prefix_plan is not None:
+            full_entries.extend(prefix_plan.entries)
+        full_entries.extend(text_entries)
+        state = runtime.machine.new_state(full_entries)
+        
+        # Setup generation state
+        if graph_cache is not None:
+            reset_graph_cache(graph_cache, runtime, prefix_plan)
+            gen_state = graph_cache.generation
+        else:
+            gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        
+        # Warmup with prefix
+        start_step = 0
+        if prefix_plan is not None:
+            print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)... ")
+            warmup_start = time.time()
+            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            warmup_time = time.time() - warmup_start
+            print(f"[Stream] Warmup done in {warmup_time:.4f}s")
+            
+            # Save warmup state for next time
+            if graph_cache is not None:
+                # Snapshot state (remove the entries we just added for this turn, keep only prefix state)
+                # Actually, warmup_with_prefix consumes the prefix entries. 
+                # The 'entries' list passed to new_state included the text entries too.
+                # We need a clean state that has processed prefix but NOT the text.
+                # But we passed 'entries' (prefix + text) to new_state.
+                # This makes caching tricky because 'state' has already consumed prefix and is ready for text.
+                # But 'state.entries' contains the text entries.
+                # We should snapshot the state but REMOVE the text entries from the snapshot.
+                
+                state_snapshot = copy.deepcopy(state)
+                # Clear entries from snapshot so it's ready for ANY new text
+                state_snapshot.entries.clear() 
+                
+                _warmup_cache = WarmupCache(
+                    prefix_key=prefix_key,
+                    start_step=start_step,
+                    state_snapshot=state_snapshot,
+                    step_tokens_snapshot=gen_state.step_tokens.clone()
+                )
+                print(f"[Stream] Warmup state cached")
     
-    # Warmup with prefix (builds KV cache) - this part can't be streamed
-    start_step = 0
-    if prefix_plan is not None:
-        print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)... ")
-        warmup_start = time.time()
-        start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-        warmup_time = time.time() - warmup_start
-        print(f"[Stream] Warmup done in {warmup_time:.4f}s")
-        print(f"[Stream] Time to generation start: {time.time() - gen_start:.4f}s")
+    print(f"[Stream] Time to generation start: {time.time() - gen_start:.4f}s")
     
     # Note: We use regular decode() for each chunk instead of streaming decode
     # The HuggingFace MimiModel doesn't have decode_streaming, but chunk-by-chunk
@@ -497,7 +560,8 @@ async def run_streaming_generation(
     first_chunk_sent = False
     last_step = start_step - 1
     
-    with torch.inference_mode():
+    # Enable Mimi streaming mode
+    with torch.inference_mode(), runtime.mimi.streaming(batch_size=1):
         for offset in range(max_context):
             t = start_step + offset
             
