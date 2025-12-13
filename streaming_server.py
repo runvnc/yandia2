@@ -421,6 +421,7 @@ async def run_streaming_generation(
     prefix_plan: Optional[PrefixPlan],
     config: GenerationConfig,
     graph_cache: Optional[CachedGraphState],
+    use_depformer_graphs: bool = True,
 ) -> AsyncGenerator[Tuple[bytes, bool], None]:
     """
     Generator that yields (audio_bytes, is_final) tuples as audio is generated.
@@ -431,7 +432,7 @@ async def run_streaming_generation(
     global _warmup_cache
     gen_start = time.time()
     # Streaming config
-    CHUNK_FRAMES = 6  # Decode every N frames after undelaying
+    CHUNK_FRAMES = 2  # Decode every N frames after undelaying (reduced from 6 for lower latency)
     
     token_ids = runtime.constants
     
@@ -595,7 +596,8 @@ async def run_streaming_generation(
             t_step_start = time.perf_counter()
             
             # Transformer step
-            if use_graph:
+            use_transformer_graph = use_graph
+            if use_transformer_graph:
                 transformer_capture, dep_captures = _execute_transformer_graph(
                     runtime=runtime,
                     step_tokens=step_tokens,
@@ -609,6 +611,8 @@ async def run_streaming_generation(
                 )
                 hidden_t = transformer_capture[1]
             else:
+                if offset == 0:
+                    print(f"[Graph] Transformer: using EAGER mode")
                 hidden_t = _execute_transformer_step(
                     step_tokens, positions_view, gen_state, 
                     runtime.transformer_step, buffers
@@ -617,6 +621,11 @@ async def run_streaming_generation(
             
             t_transformer_done = time.perf_counter()
             transformer_times.append(t_transformer_done - t_step_start)
+            
+            # Log graph status on first step
+            if offset == 0 and use_transformer_graph:
+                is_replay = transformer_capture is not None and graph_cache is not None and graph_cache.transformer_capture is not None
+                print(f"[Graph] Transformer: {'REPLAY' if is_replay else 'CAPTURE'}")
             
             # Text sampling
             guided_text = apply_classifier_guidance(
@@ -655,7 +664,9 @@ async def run_streaming_generation(
             aux_tokens.fill_(second_token)
             
             for stage in range(runtime.model.depformer.num_depth):
-                if use_graph and dep_captures is not None:
+                use_dep_graph = use_graph and dep_captures is not None and use_depformer_graphs
+                
+                if use_dep_graph:
                     dep_captures[stage] = _execute_depformer_graph(
                         stage=stage,
                         prev_audio=prev_audio,
@@ -667,6 +678,10 @@ async def run_streaming_generation(
                         buffers=buffers,
                         capture=dep_captures[stage],
                     )
+                    # Log on first step, first stage
+                    if offset == 0 and stage == 0:
+                        is_replay = dep_captures[stage].get("captured", False)
+                        print(f"[Graph] Depformer: {'REPLAY' if is_replay else 'CAPTURE'} (use_depformer_graphs={use_depformer_graphs})")
                 else:
                     _execute_depformer_stage(
                         stage_index=stage,
@@ -678,6 +693,9 @@ async def run_streaming_generation(
                         second_tokens=aux_tokens,
                         buffers=buffers,
                     )
+                    # Log on first step, first stage
+                    if offset == 0 and stage == 0:
+                        print(f"[Graph] Depformer: EAGER mode (use_depformer_graphs={use_depformer_graphs})")
                 
                 dep_logits = apply_classifier_guidance(
                     buffers.dep[stage], config.cfg_scale != 1.0, config.cfg_scale, config.cfg_filter_k
@@ -920,6 +938,11 @@ async def websocket_generate(websocket: WebSocket):
             if dia._graph_cache is None:
                 dia._graph_cache = create_graph_cache(runtime)
             
+            # Check for depformer graph disable flag
+            use_depformer_graphs = data.get("use_depformer_graphs", True)
+            if not use_depformer_graphs:
+                print(f"[WS] Depformer CUDA graphs DISABLED")
+            
             # Stream audio chunks
             if use_original_loop == "dia_generate":
                 print(f"[WS] Using dia.generate() directly (diagnostic mode 2)")
@@ -936,7 +959,7 @@ async def websocket_generate(websocket: WebSocket):
                 )
             else:
                 generator = run_streaming_generation(
-                    runtime, text, prefix_s1, prefix_s2, prefix_plan, config, dia._graph_cache
+                    runtime, text, prefix_s1, prefix_s2, prefix_plan, config, dia._graph_cache, use_depformer_graphs
                 )
             
             audio_chunks = []
