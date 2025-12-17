@@ -189,8 +189,9 @@ async def startup():
     if COMPILE_MIMI and DEVICE == "cuda":
         print(f"[Dia2] Compiling Mimi model...")
         compile_start = time.time()
-        # Use "reduce-overhead" mode and disable moshi's CUDAGraphed wrappers
-        runtime.mimi.compile(mode="reduce-overhead", disable_moshi_cuda_graphs=True)
+        # Use "default" mode - reduce-overhead conflicts with moshi's streaming state
+        # Moshi's built-in CUDAGraphed wrappers will handle CUDA graph optimization
+        runtime.mimi.compile(mode="default")
         print(f"[Dia2] Mimi compilation setup in {time.time() - compile_start:.1f}s")
         
         # Warmup decode path

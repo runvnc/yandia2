@@ -116,7 +116,7 @@ class MimiCodec(nn.Module):
         """Check if model has been compiled with torch.compile."""
         return self._compiled
 
-    def compile(self, mode: str = "reduce-overhead", disable_moshi_cuda_graphs: bool = True) -> None:
+    def compile(self, mode: str = "default", disable_moshi_cuda_graphs: bool = False) -> None:
         """Compile model components with torch.compile for faster inference.
         
         Args:
@@ -125,9 +125,13 @@ class MimiCodec(nn.Module):
                 - "max-autotune": Maximum optimization, longer compile time
                 - "reduce-overhead": Uses CUDA graphs internally - may conflict with
                   moshi's own CUDAGraphed wrappers, use with caution
-            disable_moshi_cuda_graphs: If True (default), disable moshi's internal
+            disable_moshi_cuda_graphs: If True, disable moshi's internal
                 CUDAGraphed wrappers to avoid conflicts with torch.compile's CUDA graphs.
-                This is required when using mode="reduce-overhead".
+                
+        WARNING: mode="reduce-overhead" conflicts with moshi's streaming mode even
+        when moshi's CUDAGraphed wrappers are disabled. The issue is that torch.compile's
+        internal CUDA graphs don't work well with the streaming state management.
+        Use mode="default" for safe operation with streaming.
         
         Note: This compiles the encoder, decoder, and transformer components.
         The first inference after compilation will be slower due to JIT compilation,
