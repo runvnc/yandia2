@@ -330,9 +330,18 @@ async def run_generation_with_prewarmed_cache(
     
     # Also copy the audio buffer from warmup state
     warmup_audio = incremental_warmup.warmup_state.audio_buf
-    gen_state.audio_buf[:, :, :incremental_warmup.frames_warmed + 1].copy_(
-        warmup_audio[:, :, :incremental_warmup.frames_warmed + 1]
+    frames_to_copy = incremental_warmup.frames_warmed + 1
+    gen_state.audio_buf[:, :, :frames_to_copy].copy_(
+        warmup_audio[:, :, :frames_to_copy]
     )
+    
+    # CRITICAL: Replace any remaining 'ungenerated' tokens (-2) with audio_pad
+    # This prevents CUDA errors from invalid token IDs in embedding lookups
+    ungenerated_mask = gen_state.audio_buf == token_ids.ungenerated
+    gen_state.audio_buf[ungenerated_mask] = token_ids.audio_pad
+    
+    # Also ensure the warmup portion doesn't have ungenerated tokens
+    # (it shouldn't, but just in case)
     
     transfer_time = (time.time() - transfer_start) * 1000
     print(f"[IncrGen] KV cache transferred in {transfer_time:.1f}ms, start_step={start_step}")
