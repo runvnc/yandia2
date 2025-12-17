@@ -77,6 +77,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
 
 # Configuration for optimizations
+VERBOSE_PROFILING = False  # Set to True for detailed per-step logging (adds latency!)
 COMPILE_MIMI = False  # Disabled - conflicts with moshi's CUDAGraphed wrappers in streaming mode
 ENABLE_PREFIX_CACHE = True  # Enable KV cache snapshots for prefix caching
 
@@ -600,21 +601,18 @@ async def run_streaming_generation(
     eos_cutoff = None
     total_samples = 0
     
-    print(f"[Stream] Starting generation loop from step {start_step}...")
-    print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
-    print(f"[Stream] content_start={content_start} (will decode from here)")
+    if VERBOSE_PROFILING:
+        print(f"[Stream] Starting generation loop from step {start_step}...")
+        print(f"[Stream] max_delay={max_delay}, num_codebooks={len(delays)}")
+        print(f"[Stream] content_start={content_start} (will decode from here)")
     loop_start = time.perf_counter()
     first_chunk_sent = False
     last_step = start_step - 1
     
-    # Detailed profiling
-    step_times = []
-    transformer_times = []
-    depformer_times = []
-    decode_times = []
-    
-    # Log every step
-    print(f"[Profile] Step timing (step, transformer_ms, depformer_ms, cumulative_ms):")
+    # Detailed profiling (only when verbose)
+    transformer_times = [] if VERBOSE_PROFILING else None
+    depformer_times = [] if VERBOSE_PROFILING else None
+    decode_times = [] if VERBOSE_PROFILING else None
     
     # Enable Mimi streaming mode
     with torch.inference_mode(), runtime.mimi.streaming(batch_size=1):
@@ -635,8 +633,6 @@ async def run_streaming_generation(
                 step_tokens[1:, 0, 0] = token_ids.zero
                 step_tokens[1:, 1, 0] = token_ids.pad
             
-            t_step_start = time.perf_counter()  # Note: async timing (GPU may still be working)
-            
             # Transformer step
             use_transformer_graph = use_graph
             if use_transformer_graph:
@@ -653,18 +649,15 @@ async def run_streaming_generation(
                 )
                 hidden_t = transformer_capture[1]
             else:
-                if offset == 0:
+                if offset == 0 and VERBOSE_PROFILING:
                     print(f"[Graph] Transformer: using EAGER mode")
                 hidden_t = _execute_transformer_step(
                     step_tokens, positions_view, gen_state, 
                     transformer_step, buffers
                 )
             
-            t_transformer_done = time.perf_counter()
-            transformer_times.append(t_transformer_done - t_step_start)
-            
             # Log graph status on first step
-            if offset == 0 and use_transformer_graph:
+            if offset == 0 and use_transformer_graph and VERBOSE_PROFILING:
                 is_replay = transformer_capture is not None and graph_cache is not None and graph_cache.transformer_capture is not None
                 print(f"[Graph] Transformer: {'REPLAY' if is_replay else 'CAPTURE'}")
             
@@ -696,8 +689,6 @@ async def run_streaming_generation(
             codebook_token = sample_audio_logits(masked_cb0, config.audio.temperature, config.audio.top_k)
             audio_buf[:, 0, t + 1] = codebook_token
             
-            t_depformer_start = time.perf_counter()
-            
             # Depformer stages
             prev_audio = codebook_token.expand(branches)
             main_tokens.fill_(main_token)
@@ -719,8 +710,8 @@ async def run_streaming_generation(
                         capture=dep_captures[stage],
                     )
                     # Log on first step, first stage
-                    if offset == 0 and stage == 0:
-                        is_replay = dep_captures[stage].get("captured", False)
+                    if offset == 0 and stage == 0 and VERBOSE_PROFILING:
+                        is_replay = dep_captures[stage].get("captured", False) 
                         print(f"[Graph] Depformer: {'REPLAY' if is_replay else 'CAPTURE'} (use_depformer_graphs={use_depformer_graphs})")
                 else:
                     _execute_depformer_stage(
@@ -734,7 +725,7 @@ async def run_streaming_generation(
                         buffers=buffers,
                     )
                     # Log on first step, first stage
-                    if offset == 0 and stage == 0:
+                    if offset == 0 and stage == 0 and VERBOSE_PROFILING:
                         print(f"[Graph] Depformer: EAGER mode (use_depformer_graphs={use_depformer_graphs})")
                 
                 dep_logits = apply_classifier_guidance(
@@ -748,13 +739,6 @@ async def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
-            t_depformer_done = time.perf_counter()
-            depformer_times.append(t_depformer_done - t_depformer_start)
-            
-            cumulative = (time.perf_counter() - loop_start) * 1000
-            trans_ms = transformer_times[-1] * 1000
-            dep_ms = depformer_times[-1] * 1000
-            print(f"[Step {offset:3d}] t={t:4d} trans={trans_ms:6.2f}ms dep={dep_ms:6.2f}ms cumul={cumulative:8.2f}ms")
             # Check for EOS
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -788,10 +772,7 @@ async def run_streaming_generation(
                 # Decode chunk
                 pcm = runtime.mimi.decode(chunk_tokens)
                 
-                t_decode_done = time.perf_counter()
-                decode_times.append(t_decode_done - t_decode_start)
                 waveform = pcm[0, 0] if pcm.dim() > 2 else pcm.squeeze()
-                print(f"[Decode] frames={frames_to_decode} decode_ms={decode_times[-1]*1000:.2f}ms")
                 
                 if waveform.shape[0] > 0:
                     pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
@@ -799,18 +780,9 @@ async def run_streaming_generation(
                     
                     if not first_chunk_sent:
                         first_chunk_sent = True
-                        print(f"[Stream] First chunk sent after {time.perf_counter() - loop_start:.4f}s (Total: {time.time() - gen_start:.4f}s)")
-                    
-                        # Print detailed timing for first chunk
-                        steps_for_first = len(transformer_times)
-                        print(f"[Profile] Steps to first chunk: {steps_for_first}")
-                        if transformer_times:
-                            print(f"[Profile] Transformer: avg={sum(transformer_times)/len(transformer_times)*1000:.2f}ms, total={sum(transformer_times)*1000:.2f}ms")
-                        if depformer_times:
-                            print(f"[Profile] Depformer: avg={sum(depformer_times)/len(depformer_times)*1000:.2f}ms, total={sum(depformer_times)*1000:.2f}ms")
-                        if decode_times:
-                            print(f"[Profile] Decode: avg={sum(decode_times)/len(decode_times)*1000:.2f}ms, total={sum(decode_times)*1000:.2f}ms")
-                        print(f"[Profile] First {min(5, len(transformer_times))} transformer steps (ms): {[f'{t*1000:.2f}' for t in transformer_times[:5]]}")
+                        first_chunk_time = time.perf_counter() - loop_start
+                        total_time_to_first = time.time() - gen_start
+                        print(f"[Stream] First chunk: {first_chunk_time:.3f}s (total: {total_time_to_first:.3f}s)")
                     
                     yield (pcm16, False)
                 
