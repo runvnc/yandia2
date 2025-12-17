@@ -1,6 +1,6 @@
 # Yandia2 Project Handoff Document
 
-**Last Updated**: December 13, 2025  
+**Last Updated**: December 17, 2025  
 **Project**: `/files/yandia2`  
 **GitHub**: `https://github.com/runvnc/yandia2`  
 **Current Tag**: `1s_new_streaming_ok`
@@ -16,6 +16,12 @@ Yandia2 is a **Dia2 TTS conversation server** with **native Kyutai Mimi streamin
 - Total warmup: ~2.76s (prefix processing)
 - RTF (Real-Time Factor): ~0.96 (nearly real-time)
 - Audio generation: 2.16s audio in 2.07s
+
+**NEW: Incremental Warmup (In Progress)**
+- Pre-warms KV cache AS audio streams in
+- Eliminates ~2.76s warmup delay at generation time
+- Target: ~1.5s total latency to first audio
+- See `conversation_stream.py` for implementation
 
 **Key Achievement:** Integrated the original Kyutai Mimi codec (from moshi package) with native `StreamingModule` support, replacing the HuggingFace MimiModel.
 
@@ -60,6 +66,7 @@ with mimi.streaming(batch_size=1):
 | `dia2/audio/codec.py` | Kyutai Mimi wrapper with streaming support |
 | `dia2/audio/codec_hf.py` | Backup of HuggingFace implementation |
 | `streaming_server.py` | Main server with WebSocket streaming |
+| `conversation_stream.py` | **NEW** Incremental warmup + streaming conversation handler |
 | `conversation_server.py` | REST-only server (no streaming decode) |
 
 ### Codec Architecture
@@ -111,12 +118,58 @@ class MimiCodec(nn.Module):
 
 ## Optimization Opportunities
 
-### 1. Pre-warm During User Speech (High Impact)
+### 1. Incremental Warmup (IMPLEMENTED)
 
-The ~2.76s warmup happens AFTER the user finishes speaking. Could pre-warm:
-- Start prefix warmup as soon as user audio arrives
-- Run transcription in parallel with warmup
-- Have prefix ready when generation text arrives
+**Status**: Implemented in `conversation_stream.py`
+
+The ~2.76s warmup previously happened AFTER the user finishes speaking. The new incremental warmup system:
+
+1. **Pre-warms AI voice** at session init (one-time cost)
+2. **Processes user audio AS IT ARRIVES** - each audio chunk is encoded and run through the transformer immediately
+3. **Transfers pre-warmed KV cache** to generation state when generate is triggered
+4. **Skips warmup entirely** at generation time
+
+**Key Classes:**
+- `IncrementalWarmup` - Manages incremental KV cache warmup
+- `StreamingConversationHandler` - WebSocket handler using incremental warmup
+- `run_generation_with_prewarmed_cache()` - Generation loop that uses pre-warmed cache
+- `_reinit_warmup_for_new_turn()` - Reinitializes warmup with previous AI audio
+
+**Flow:**
+```
+1. Client sends init with AI voice + timestamps
+   -> IncrementalWarmup created, AI voice pre-warmed
+
+2. Client streams audio chunks (binary WebSocket messages)
+   -> Each chunk encoded to tokens
+   -> Tokens added to warmup manager
+   -> Transformer steps run immediately (builds KV cache)
+
+3. Client sends word timestamps from Deepgram
+   -> Stored for state machine processing
+
+4. Client sends generate request with AI text
+   -> KV cache already warmed!
+   -> Transfer snapshot to generation state
+   -> Start generation immediately (no warmup delay)
+   -> After generation: save AI audio, schedule warmup reinit
+
+5. Next turn starts (user speaks again)
+   -> Warmup reinitialized with previous AI audio
+   -> User audio warmed incrementally on top
+   -> Repeat from step 2
+```
+
+**WebSocket Endpoint:** `/ws/conversation_stream`
+
+**Expected Latency Improvement:**
+- Before: ~3.9s (2.76s warmup + 1.14s first chunk)
+- After: ~1.5s (0s warmup + 1.5s first chunk with 18-frame delay)
+
+**Limitations:**
+- Requires Deepgram timestamps (bypasses Whisper)
+- AI timestamps from generation not yet extracted (uses empty list)
+- Warmup reinit happens on first audio chunk of new turn (small delay)
 
 ### 2. Cache Transcription Results (Already Done)
 
@@ -142,6 +195,7 @@ The `stream-dia2` project explored KV cache snapshots to avoid per-request warmu
 
 | Tag | Description |
 |-----|-------------|
+| `incremental_warmup` | Incremental warmup implementation |
 | `1s_new_streaming_ok` | **CURRENT** - Kyutai Mimi native streaming, working |
 | `stream_clone_artifact` | Voice cloning works, minor artifact at start |
 | `working_rtf_1.6` | With CUDA graph caching (~5-6s, RTF ~1.6) |
@@ -203,6 +257,7 @@ python streaming_server.py  # Runs on port 3030
 | `/user_spoke` | POST | Upload user audio (file) |
 | `/generate` | POST | Generate AI speech (REST, complete audio) |
 | `/ws/generate` | WebSocket | Stream audio chunks (native Mimi streaming) |
+| `/ws/conversation_stream` | WebSocket | **NEW** Streaming with incremental warmup |
 | `/state` | GET | Get current conversation state |
 
 ---
@@ -265,6 +320,7 @@ Note: The HuggingFace version doesn't have native streaming support, so the stre
 │   ├── engine.py              # Main Dia2 class
 │   └── runtime/
 │       ├── generator.py       # Generation loop + CUDA graphs
+│       ├── prefix_cache.py    # KV cache snapshot/restore for prefix caching
 │       ├── voice_clone.py     # Prefix/voice handling
 │       └── ...
 ├── streaming_server.py        # Main server (REST + WebSocket streaming)
@@ -276,6 +332,8 @@ Note: The HuggingFace version doesn't have native streaming support, so the stre
 ├── test_streaming.py          # Python streaming client
 ├── example_prefix1.wav        # Example AI voice
 ├── example_prefix2.wav        # Example user voice
+├── conversation_stream.py     # **NEW** Incremental warmup handler
+├── test_conversation_stream.py # Test client for incremental warmup
 └── HANDOFF.md                 # This document
 ```
 
