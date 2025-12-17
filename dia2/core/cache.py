@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
+
+
+@dataclass
+class KVCacheSnapshot:
+    """Snapshot of KV cache state at a specific step.
+    
+    This allows saving and restoring the KV cache state for prefix caching,
+    enabling fast restoration of warmed-up state without re-running the
+    transformer through prefix tokens.
+    
+    Attributes:
+        length: Number of steps stored in the snapshot
+        keys: List of key tensors, one per layer, shape [B, H, length, D]
+        values: List of value tensors, one per layer, shape [B, H, length, D]
+    """
+    length: int
+    keys: List[torch.Tensor]
+    values: List[torch.Tensor]
 
 
 @dataclass
@@ -38,6 +56,26 @@ class CacheSlot:
         self.length.zero_()
 
     def rewind(self, length: int) -> None:
+        self.length.fill_(length)
+
+    def snapshot(self) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Create a snapshot of this slot's current data.
+        
+        Returns:
+            Tuple of (keys, values, length) where keys and values are cloned
+            tensors containing only the valid portion of the cache.
+        """
+        length = int(self.length.item())
+        return (
+            self.keys[:, :, :length, :].clone(),
+            self.values[:, :, :length, :].clone(),
+            length
+        )
+
+    def restore(self, keys: torch.Tensor, values: torch.Tensor, length: int) -> None:
+        """Restore this slot from a snapshot."""
+        self.keys[:, :, :length, :].copy_(keys)
+        self.values[:, :, :length, :].copy_(values)
         self.length.fill_(length)
 
     # Due to many CacheSlot instances being used in a model, we disable
@@ -112,5 +150,35 @@ class KVCache:
 
     clear = reset
 
+    def snapshot(self) -> KVCacheSnapshot:
+        """Create a snapshot of the entire cache state.
+        
+        This clones all key/value data up to the current length, allowing
+        the cache to be restored later without re-running the transformer.
+        
+        Returns:
+            KVCacheSnapshot containing cloned key/value tensors for all layers.
+        """
+        if not self.slots:
+            return KVCacheSnapshot(0, [], [])
+        
+        length = int(self.slots[0].length.item())
+        keys = [slot.keys[:, :, :length, :].clone() for slot in self.slots]
+        values = [slot.values[:, :, :length, :].clone() for slot in self.slots]
+        return KVCacheSnapshot(length, keys, values)
 
-__all__ = ["CacheSlot", "KVCache"]
+    def restore(self, snapshot: KVCacheSnapshot) -> None:
+        """Restore cache from a snapshot.
+        
+        This copies the snapshot data back into the cache slots and sets
+        the length appropriately.
+        
+        Args:
+            snapshot: Previously created KVCacheSnapshot
+        """
+        for i, slot in enumerate(self.slots):
+            slot.keys[:, :, :snapshot.length, :].copy_(snapshot.keys[i])
+            slot.values[:, :, :snapshot.length, :].copy_(snapshot.values[i])
+            slot.length.fill_(snapshot.length)
+
+__all__ = ["CacheSlot", "KVCache", "KVCacheSnapshot"]

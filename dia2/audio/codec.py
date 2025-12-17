@@ -1,6 +1,8 @@
 # codec.py - Kyutai Mimi with native streaming support
 # This uses the original Kyutai Mimi from the moshi package which has
 # built-in StreamingModule support for efficient incremental decoding.
+# Added: compile() method for torch.compile optimization
+# Added: warmup_decode() method for pre-warming CUDA graphs
 #
 # To revert to HuggingFace MimiModel (no native streaming):
 #   cp dia2/audio/codec_hf.py dia2/audio/codec.py
@@ -62,6 +64,8 @@ class MimiCodec(nn.Module):
         self.frame_rate = model.frame_rate
         self.samples_per_frame = model.frame_size
         self._streaming_context: Optional[ExitStack] = None
+        self._compiled = False
+        self._compile_mode: Optional[str] = None
 
     @classmethod
     def from_pretrained(
@@ -105,6 +109,63 @@ class MimiCodec(nn.Module):
     def is_streaming(self) -> bool:
         """Check if currently in streaming mode."""
         return self._streaming_context is not None
+
+    @property
+    def is_compiled(self) -> bool:
+        """Check if model has been compiled with torch.compile."""
+        return self._compiled
+
+    def compile(self, mode: str = "reduce-overhead") -> None:
+        """Compile model components with torch.compile for faster inference.
+        
+        Args:
+            mode: Compilation mode. Options:
+                - "reduce-overhead": Good balance of compile time and speedup (recommended)
+                - "max-autotune": Maximum optimization, longer compile time
+                - "default": Fastest compile, moderate speedup
+        
+        Note: This compiles the encoder, decoder, and transformer components.
+        The first inference after compilation will be slower due to JIT compilation,
+        so call warmup_decode() after this to pre-warm the compiled functions.
+        """
+        if self._compiled:
+            print(f"[MimiCodec] Already compiled with mode '{self._compile_mode}'")
+            return
+        
+        print(f"[MimiCodec] Compiling model components with mode='{mode}'...")
+        
+        # Compile the main components
+        self.model.encoder = torch.compile(self.model.encoder, mode=mode)
+        self.model.decoder = torch.compile(self.model.decoder, mode=mode)
+        
+        if self.model.encoder_transformer is not None:
+            self.model.encoder_transformer = torch.compile(
+                self.model.encoder_transformer, mode=mode
+            )
+        if self.model.decoder_transformer is not None:
+            self.model.decoder_transformer = torch.compile(
+                self.model.decoder_transformer, mode=mode
+            )
+        
+        self._compiled = True
+        self._compile_mode = mode
+        print(f"[MimiCodec] Compilation complete")
+
+    def warmup_decode(self, num_frames: int = 3, batch_size: int = 1, num_warmup_calls: int = 3) -> None:
+        """Pre-warm the decode path to trigger JIT compilation and CUDA graph capture.
+        
+        Args:
+            num_frames: Number of frames per decode call (should match typical usage)
+            batch_size: Batch size for warmup
+            num_warmup_calls: Number of decode calls to make for thorough warmup
+        """
+        print(f"[MimiCodec] Warming up decode path ({num_warmup_calls} calls, {num_frames} frames each)...")
+        dummy_codes = torch.zeros(batch_size, 32, num_frames, dtype=torch.long, device=self.device)
+        
+        with self.streaming(batch_size):
+            for i in range(num_warmup_calls):
+                _ = self.decode(dummy_codes)
+        print(f"[MimiCodec] Warmup complete")
 
     def start_streaming(self, batch_size: int = 1) -> None:
         """Enter streaming mode.

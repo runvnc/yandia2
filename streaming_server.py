@@ -13,6 +13,10 @@ Expected latency:
 - Subsequent chunks: ~150-250ms intervals
 - Total to first audio: ~1.5-2.5s
 """
+# Optimizations added:
+# - Mimi model compilation (torch.compile) for faster decode
+# - KV cache snapshots for prefix caching (eliminates warmup for cached prefixes)
+
 import os
 import tempfile
 import time
@@ -58,6 +62,13 @@ from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
 from dia2.audio.grid import mask_audio_logits, delay_frames, undelay_frames
 
+# Import new prefix caching module
+from dia2.runtime.prefix_cache import (
+    PrefixCacheStore,
+    compute_prefix_key,
+    save_prefix_cache,
+    restore_prefix_cache,
+)
 app = FastAPI(title="Dia2 Streaming Conversation Server")
 
 # Configuration
@@ -65,6 +76,9 @@ MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
 
+# Configuration for optimizations
+COMPILE_MIMI = True  # Enable torch.compile for Mimi decoder
+ENABLE_PREFIX_CACHE = True  # Enable KV cache snapshots for prefix caching
 
 # Global model instance
 dia: Optional[Dia2] = None
@@ -76,16 +90,8 @@ CONV_DIR.mkdir(exist_ok=True)
 # Transcription cache
 _transcription_cache = {}
 
-# Warmup cache for persistent sessions
-@dataclass
-class WarmupCache:
-    prefix_key: str  # Hash or identifier of the prefix configuration
-    start_step: int
-    state_snapshot: State
-    step_tokens_snapshot: torch.Tensor
-
-_warmup_cache: Optional[WarmupCache] = None
-
+# Prefix cache store for KV cache snapshots
+_prefix_cache_store: Optional[PrefixCacheStore] = None
 @dataclass
 class ConversationState:
     """Tracks the current conversation state."""
@@ -170,9 +176,25 @@ async def startup():
     _setup_caching()
     
     dia = Dia2.from_repo(MODEL_REPO, device=DEVICE, dtype=DTYPE)
-    _ = dia._ensure_runtime()
+    runtime = dia._ensure_runtime()
     print(f"[Dia2] Model loaded in {time.time() - start:.1f}s")
     print(f"[Dia2] Sample rate: {dia.sample_rate}")
+    
+    # Initialize prefix cache store
+    global _prefix_cache_store
+    _prefix_cache_store = PrefixCacheStore(max_entries=10)
+    print(f"[Dia2] Prefix cache initialized (max_entries=10)")
+    
+    # Compile Mimi for faster decode
+    if COMPILE_MIMI and DEVICE == "cuda":
+        print(f"[Dia2] Compiling Mimi model...")
+        compile_start = time.time()
+        runtime.mimi.compile(mode="reduce-overhead")
+        print(f"[Dia2] Mimi compilation setup in {time.time() - compile_start:.1f}s")
+        
+        # Warmup decode path
+        print(f"[Dia2] Warming up Mimi decode...")
+        runtime.mimi.warmup_decode(num_frames=3, batch_size=1, num_warmup_calls=5)
     
     # Clean up old conversation files
     for f in CONV_DIR.glob("*.wav"):
@@ -199,7 +221,7 @@ async def health():
 @app.post("/reset")
 async def reset_conversation():
     """Reset the conversation state."""
-    global _warmup_cache
+    global _prefix_cache_store
     global conversation
     
     for f in CONV_DIR.glob("*.wav"):
@@ -210,9 +232,10 @@ async def reset_conversation():
     # Clear graph cache for fresh start
     if dia is not None:
         dia.clear_graph_cache()
-        
-    # Clear warmup cache
-    _warmup_cache = None
+    
+    # Clear prefix cache
+    if _prefix_cache_store is not None:
+        _prefix_cache_store.clear()
     
     print("[Dia2] Conversation reset")
     return {"status": "ok", "message": "Conversation reset"}
@@ -430,7 +453,7 @@ async def run_streaming_generation(
     This is the core streaming logic - it runs the generation loop and yields
     audio chunks incrementally instead of waiting for full generation.
     """
-    global _warmup_cache
+    global _prefix_cache_store
     gen_start = time.time()
     # Streaming config
     CHUNK_FRAMES = 1  # Decode every frame for minimum latency
@@ -442,72 +465,68 @@ async def run_streaming_generation(
     
     runtime.machine.initial_padding = config.initial_padding
     
-    # Check if we can reuse warmup state
-    # Key depends on prefix audio paths
-    prefix_key = f"{prefix_s1}:{prefix_s2}"
+    # Compute prefix key for caching
+    aligned_frames = prefix_plan.aligned_frames if prefix_plan else 0
+    prefix_key = compute_prefix_key(prefix_s1, prefix_s2, aligned_frames)
     
-    is_warmed_up = False
-    if _warmup_cache is not None and _warmup_cache.prefix_key == prefix_key and graph_cache is not None:
-        print(f"[Stream] Using cached warmup state (key={prefix_key})")
+    # Check if we have a cached prefix with KV snapshots
+    cached_entry = None
+    if ENABLE_PREFIX_CACHE and _prefix_cache_store is not None:
+        cached_entry = _prefix_cache_store.get(prefix_key)
+    
+    if cached_entry is not None and graph_cache is not None:
+        print(f"[Stream] CACHE HIT - Restoring from KV snapshot (key={prefix_key[:8]}...)")
+        restore_start = time.time()
         
-        # Restore state
-        start_step = _warmup_cache.start_step
-        state = copy.deepcopy(_warmup_cache.state_snapshot)
-        state.entries.extend(text_entries)
-        
-        # Rewind graph cache
-        rewind_graph_cache(graph_cache, start_step, _warmup_cache.step_tokens_snapshot)
+        # Setup generation state from graph cache
+        reset_graph_cache(graph_cache, runtime, prefix_plan)
         gen_state = graph_cache.generation
         
-        is_warmed_up = True
-    else:
-        print(f"[Stream] Full warmup required (key={prefix_key})")
+        # Restore KV cache from snapshot (this is the key optimization!)
+        start_step = restore_prefix_cache(cached_entry, gen_state)
         
-        # Create FRESH state machine
+        # Create fresh state machine with text entries only
+        # (prefix entries were already processed when snapshot was taken)
+        state = runtime.machine.new_state(text_entries)
+        
+        restore_time = time.time() - restore_start
+        print(f"[Stream] Cache restore done in {restore_time*1000:.2f}ms (saved ~{aligned_frames * 0.025:.2f}s warmup)")
+    else:
+        if cached_entry is None:
+            print(f"[Stream] CACHE MISS - Full warmup required (key={prefix_key[:8]}...)")
+        else:
+            print(f"[Stream] Full warmup (no graph cache)")
+        
+        # Create fresh state machine with all entries
         full_entries = []
         if prefix_plan is not None:
             full_entries.extend(prefix_plan.entries)
         full_entries.extend(text_entries)
         state = runtime.machine.new_state(full_entries)
         
-        # Setup generation state
+        # Setup generation state from graph cache or fresh
         if graph_cache is not None:
             reset_graph_cache(graph_cache, runtime, prefix_plan)
             gen_state = graph_cache.generation
         else:
             gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
-        # Warmup with prefix
+        # Warmup with prefix (runs transformer through prefix tokens)
         start_step = 0
         if prefix_plan is not None:
-            print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)... ")
+            print(f"[Stream] Warming up with prefix ({prefix_plan.aligned_frames} frames)...")
             warmup_start = time.time()
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
             warmup_time = time.time() - warmup_start
             print(f"[Stream] Warmup done in {warmup_time:.4f}s")
             
-            # Save warmup state for next time
-            if graph_cache is not None:
-                # Snapshot state (remove the entries we just added for this turn, keep only prefix state)
-                # Actually, warmup_with_prefix consumes the prefix entries. 
-                # The 'entries' list passed to new_state included the text entries too.
-                # We need a clean state that has processed prefix but NOT the text.
-                # But we passed 'entries' (prefix + text) to new_state.
-                # This makes caching tricky because 'state' has already consumed prefix and is ready for text.
-                # But 'state.entries' contains the text entries.
-                # We should snapshot the state but REMOVE the text entries from the snapshot.
-                
-                state_snapshot = copy.deepcopy(state)
-                # Clear entries from snapshot so it's ready for ANY new text
-                state_snapshot.entries.clear() 
-                
-                _warmup_cache = WarmupCache(
-                    prefix_key=prefix_key,
-                    start_step=start_step,
-                    state_snapshot=state_snapshot,
-                    step_tokens_snapshot=gen_state.step_tokens.clone()
-                )
-                print(f"[Stream] Warmup state cached")
+            # Save KV cache snapshot for future use
+            if ENABLE_PREFIX_CACHE and _prefix_cache_store is not None:
+                print(f"[Stream] Saving KV cache snapshot...")
+                save_start = time.time()
+                save_prefix_cache(_prefix_cache_store, prefix_key, gen_state, start_step)
+                save_time = time.time() - save_start
+                print(f"[Stream] Snapshot saved in {save_time*1000:.2f}ms (key={prefix_key[:8]}...)")
     
     print(f"[Stream] Time to generation start: {time.time() - gen_start:.4f}s")
     
@@ -1150,6 +1169,24 @@ async def get_state():
         "turn_count": conversation.turn_count,
         "last_ai_audio": conversation.last_ai_audio,
         "last_user_audio": conversation.last_user_audio,
+    }
+
+
+@app.get("/cache_stats")
+async def cache_stats():
+    """Get prefix cache statistics."""
+    if _prefix_cache_store is None:
+        return {"status": "disabled", "message": "Prefix cache not initialized"}
+    
+    stats = _prefix_cache_store.stats()
+    return {
+        "status": "ok",
+        "prefix_cache": stats,
+        "mimi_compiled": dia._ensure_runtime().mimi.is_compiled if dia else False,
+        "config": {
+            "compile_mimi": COMPILE_MIMI,
+            "enable_prefix_cache": ENABLE_PREFIX_CACHE,
+        }
     }
 
 
