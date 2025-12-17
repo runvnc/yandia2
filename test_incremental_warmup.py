@@ -6,6 +6,10 @@ with pre-warmed KV cache across multiple turns.
 
 Usage:
     python test_incremental_warmup.py
+
+Environment variables:
+    SERVER_URL - HTTP server URL (default: http://localhost:3030)
+    WS_URL - WebSocket URL for conversation_stream (default: derived from SERVER_URL)
 """
 import asyncio
 import json
@@ -22,7 +26,19 @@ except ImportError:
     exit(1)
 
 
-SERVER_URL = "ws://localhost:3030/ws/conversation_stream"
+# Configurable via environment variables (same pattern as test_streaming.py)
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
+
+# Derive WS_URL from SERVER_URL if not explicitly set
+if "WS_URL" in os.environ:
+    WS_URL = os.environ["WS_URL"]
+else:
+    # Convert http(s):// to ws(s)://
+    if SERVER_URL.startswith("https://"):
+        WS_URL = "wss://" + SERVER_URL[8:] + "/ws/conversation_stream"
+    else:
+        WS_URL = "ws://" + SERVER_URL[7:] + "/ws/conversation_stream"
+
 AI_VOICE_PATH = "example_prefix1.wav"  # Adjust path as needed
 USER_VOICE_PATH = "example_prefix2.wav"  # For simulating user audio
 
@@ -87,15 +103,17 @@ async def test_multi_turn_conversation():
     """Test multi-turn conversation with incremental warmup."""
     print(f"\n{'='*60}")
     print("Testing Multi-Turn Incremental Warmup")
+    print(f"Server URL: {SERVER_URL}")
+    print(f"WebSocket URL: {WS_URL}")
     print(f"{'='*60}\n")
     
     # Check if user audio exists for multi-turn test
-    has_user_audio = os.path.exists(USER_VOICE_PATH)
+    has_user_audio = Path(USER_VOICE_PATH).exists()
     if not has_user_audio:
         print(f"NOTE: {USER_VOICE_PATH} not found, will test without user audio")
     
     try:
-        async with websockets.connect(SERVER_URL) as ws:
+        async with websockets.connect(WS_URL) as ws:
             # 1. Wait for ready message
             msg = await ws.recv()
             data = json.loads(msg)
@@ -252,8 +270,8 @@ async def test_multi_turn_conversation():
             print(f"{'='*60}\n")
             return True
             
-    except ConnectionRefusedError:
-        print(f"ERROR: Could not connect to {SERVER_URL}")
+    except (ConnectionRefusedError, OSError) as e:
+        print(f"ERROR: Could not connect to {WS_URL}")
         print("Make sure the server is running: python streaming_server.py")
         return False
     except Exception as e:
