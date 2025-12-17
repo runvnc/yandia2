@@ -324,6 +324,9 @@ async def run_generation_with_prewarmed_cache(
     else:
         gen_state = build_initial_state(runtime, prefix=None)
     
+    # Get token IDs for later use
+    token_ids = runtime.constants
+    
     # Transfer pre-warmed KV cache from incremental warmup
     transfer_start = time.time()
     start_step = incremental_warmup.transfer_to_generation(gen_state)
@@ -356,7 +359,6 @@ async def run_generation_with_prewarmed_cache(
     # This lets us reuse run_streaming_generation's loop
     
     # Actually, let's just inline the generation loop here for full control
-    token_ids = runtime.constants
     step_tokens = gen_state.step_tokens
     audio_buf = gen_state.audio_buf
     branches = step_tokens.shape[0]
