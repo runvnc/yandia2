@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
@@ -104,6 +105,84 @@ def _process_prefix_audio(
     return entries, steps, tokens
 
 
+def build_prefix_plan_with_timestamps(
+    runtime: "RuntimeContext",
+    speaker_1_audio: str,
+    speaker_1_timestamps: List[dict],
+    speaker_2_audio: Optional[str] = None,
+    speaker_2_timestamps: Optional[List[dict]] = None,
+) -> Optional[PrefixPlan]:
+    """Build a prefix plan using external timestamps (bypassing Whisper).
+    
+    This is useful when you already have word timestamps from another source
+    like Deepgram, avoiding the ~2-3s Whisper transcription overhead.
+    
+    Args:
+        runtime: The runtime context
+        speaker_1_audio: Path to speaker 1 audio file
+        speaker_1_timestamps: List of {"word": str, "start": float, "end": float}
+        speaker_2_audio: Optional path to speaker 2 audio file
+        speaker_2_timestamps: Optional list of timestamps for speaker 2
+    
+    Returns:
+        PrefixPlan or None if no audio provided
+    """
+    if not speaker_1_audio:
+        return None
+    
+    # Convert external timestamps to WhisperWord format
+    words1 = [
+        WhisperWord(text=t["word"], start=t["start"], end=t["end"])
+        for t in speaker_1_timestamps
+    ]
+    
+    # Process speaker 1
+    entries1, steps1 = words_to_entries(
+        words=words1,
+        tokenizer=runtime.tokenizer,
+        speaker_token=runtime.constants.spk1,
+        frame_rate=runtime.frame_rate,
+    )
+    
+    # Load and encode audio
+    audio1 = load_mono_audio(speaker_1_audio, runtime.mimi.sample_rate)
+    tokens1 = encode_audio_tokens(runtime.mimi, audio1)
+    
+    offset = 3  # Match legacy BOS/PAD offset
+    entries = list(entries1)
+    new_word_steps = [step + offset for step in steps1]
+    audio_tokens = tokens1.to(runtime.device)
+    
+    # Process speaker 2 if provided
+    if speaker_2_audio and speaker_2_timestamps:
+        words2 = [
+            WhisperWord(text=t["word"], start=t["start"], end=t["end"])
+            for t in speaker_2_timestamps
+        ]
+        
+        entries2, steps2 = words_to_entries(
+            words=words2,
+            tokenizer=runtime.tokenizer,
+            speaker_token=runtime.constants.spk2,
+            frame_rate=runtime.frame_rate,
+        )
+        
+        audio2 = load_mono_audio(speaker_2_audio, runtime.mimi.sample_rate)
+        tokens2 = encode_audio_tokens(runtime.mimi, audio2)
+        
+        spk1_frames = audio_tokens.shape[-1]
+        new_word_steps.extend(step + spk1_frames for step in steps2)
+        entries.extend(entries2)
+        audio_tokens = torch.cat([audio_tokens, tokens2.to(runtime.device)], dim=1)
+    
+    return PrefixPlan(
+        entries=entries,
+        new_word_steps=new_word_steps,
+        aligned_tokens=audio_tokens,
+        aligned_frames=audio_tokens.shape[-1],
+    )
+
+
 def transcribe_words(
     audio_path: str,
     device: torch.device,
@@ -185,6 +264,7 @@ __all__ = [
     "PrefixPlan",
     "WhisperWord",
     "build_prefix_plan",
+    "build_prefix_plan_with_timestamps",
     "transcribe_words",
     "words_to_entries",
 ]

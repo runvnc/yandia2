@@ -69,6 +69,12 @@ from dia2.runtime.prefix_cache import (
     save_prefix_cache,
     restore_prefix_cache,
 )
+
+# Import streaming conversation handler
+from conversation_stream import create_conversation_websocket_handler
+from dia2.runtime.voice_clone import build_prefix_plan_with_timestamps
+
+
 app = FastAPI(title="Dia2 Streaming Conversation Server")
 
 # Configuration
@@ -203,6 +209,10 @@ async def startup():
     for f in CONV_DIR.glob("*.wav"):
         f.unlink()
     print(f"[Dia2] Conversation directory: {CONV_DIR}")
+    
+    # Register streaming conversation endpoint
+    await create_conversation_websocket_handler(app, dia)
+    print(f"[Dia2] Streaming conversation endpoint registered: /ws/conversation_stream")
 
 
 @app.get("/health")
