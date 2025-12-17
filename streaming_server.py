@@ -77,7 +77,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
 
 # Configuration for optimizations
-COMPILE_MIMI = True  # Enable torch.compile for Mimi decoder
+COMPILE_MIMI = False  # Disabled - conflicts with moshi's CUDAGraphed wrappers in streaming mode
 ENABLE_PREFIX_CACHE = True  # Enable KV cache snapshots for prefix caching
 
 # Global model instance
