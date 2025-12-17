@@ -115,18 +115,22 @@ class MimiCodec(nn.Module):
         """Check if model has been compiled with torch.compile."""
         return self._compiled
 
-    def compile(self, mode: str = "reduce-overhead") -> None:
+    def compile(self, mode: str = "default") -> None:
         """Compile model components with torch.compile for faster inference.
         
         Args:
             mode: Compilation mode. Options:
-                - "reduce-overhead": Good balance of compile time and speedup (recommended)
+                - "default": Fastest compile, moderate speedup (recommended)
                 - "max-autotune": Maximum optimization, longer compile time
-                - "default": Fastest compile, moderate speedup
+                - "reduce-overhead": Uses CUDA graphs internally - may conflict with
+                  moshi's own CUDAGraphed wrappers, use with caution
         
         Note: This compiles the encoder, decoder, and transformer components.
         The first inference after compilation will be slower due to JIT compilation,
         so call warmup_decode() after this to pre-warm the compiled functions.
+        
+        WARNING: The moshi library uses its own CUDAGraphed wrappers in streaming mode.
+        Using mode="reduce-overhead" can cause conflicts. Use mode="default" for safety.
         """
         if self._compiled:
             print(f"[MimiCodec] Already compiled with mode '{self._compile_mode}'")

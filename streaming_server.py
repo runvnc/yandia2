@@ -189,7 +189,8 @@ async def startup():
     if COMPILE_MIMI and DEVICE == "cuda":
         print(f"[Dia2] Compiling Mimi model...")
         compile_start = time.time()
-        runtime.mimi.compile(mode="reduce-overhead")
+        # Use "default" mode to avoid conflicts with moshi's CUDAGraphed wrappers
+        runtime.mimi.compile(mode="default")
         print(f"[Dia2] Mimi compilation setup in {time.time() - compile_start:.1f}s")
         
         # Warmup decode path

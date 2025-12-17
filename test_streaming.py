@@ -42,7 +42,7 @@ except ImportError:
 
 # Configurable via environment variables
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3030")
-VOICE_FILE = os.environ.get("VOICE_FILE", "example_prefix1.wav")
+VOICE_FILE = os.environ.get("VOICE_FILE", "man1.mp3")
 NO_DEPFORMER_GRAPHS = os.environ.get("NO_DEPFORMER_GRAPHS", "") == "1"
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "") == "1"
 
