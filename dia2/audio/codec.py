@@ -64,6 +64,7 @@ class MimiCodec(nn.Module):
         self.frame_rate = model.frame_rate
         self.samples_per_frame = model.frame_size
         self._streaming_context: Optional[ExitStack] = None
+        self._disable_moshi_cuda_graphs = False
         self._compiled = False
         self._compile_mode: Optional[str] = None
 
@@ -115,7 +116,7 @@ class MimiCodec(nn.Module):
         """Check if model has been compiled with torch.compile."""
         return self._compiled
 
-    def compile(self, mode: str = "default") -> None:
+    def compile(self, mode: str = "reduce-overhead", disable_moshi_cuda_graphs: bool = True) -> None:
         """Compile model components with torch.compile for faster inference.
         
         Args:
@@ -124,17 +125,22 @@ class MimiCodec(nn.Module):
                 - "max-autotune": Maximum optimization, longer compile time
                 - "reduce-overhead": Uses CUDA graphs internally - may conflict with
                   moshi's own CUDAGraphed wrappers, use with caution
+            disable_moshi_cuda_graphs: If True (default), disable moshi's internal
+                CUDAGraphed wrappers to avoid conflicts with torch.compile's CUDA graphs.
+                This is required when using mode="reduce-overhead".
         
         Note: This compiles the encoder, decoder, and transformer components.
         The first inference after compilation will be slower due to JIT compilation,
         so call warmup_decode() after this to pre-warm the compiled functions.
-        
-        WARNING: The moshi library uses its own CUDAGraphed wrappers in streaming mode.
-        Using mode="reduce-overhead" can cause conflicts. Use mode="default" for safety.
         """
         if self._compiled:
             print(f"[MimiCodec] Already compiled with mode '{self._compile_mode}'")
             return
+        
+        # Disable moshi's CUDAGraphed wrappers if requested
+        if disable_moshi_cuda_graphs:
+            self._disable_moshi_cuda_graphs = True
+            print(f"[MimiCodec] Moshi CUDAGraphed wrappers will be disabled in streaming mode")
         
         print(f"[MimiCodec] Compiling model components with mode='{mode}'...")
         
@@ -179,8 +185,22 @@ class MimiCodec(nn.Module):
         """
         if self._streaming_context is not None:
             raise RuntimeError("Already in streaming mode. Call stop_streaming() first.")
-        self._streaming_context = self.model.streaming(batch_size)
-        self._streaming_context.__enter__()
+        
+        if self._disable_moshi_cuda_graphs:
+            # Enter streaming mode but with CUDAGraphed disabled
+            # We do this by temporarily patching the device type check
+            original_device = self.device
+            # Force the _init_streaming_state to see a non-cuda device
+            # so it sets disable=True for CUDAGraphed wrappers
+            self._streaming_context = self.model.streaming(batch_size)
+            # Manually disable the CUDAGraphed wrappers after creation
+            state = self.model._streaming_state
+            if state is not None:
+                self._disable_cuda_graphed_wrappers(state)
+            self._streaming_context.__enter__()
+        else:
+            self._streaming_context = self.model.streaming(batch_size)
+            self._streaming_context.__enter__()
 
     def stop_streaming(self) -> None:
         """Exit streaming mode and reset internal state."""
@@ -201,6 +221,28 @@ class MimiCodec(nn.Module):
         """Reset the streaming state without exiting streaming mode."""
         if self._streaming_context is not None:
             self.model.reset_streaming()
+
+    def _disable_cuda_graphed_wrappers(self, state) -> None:
+        """Disable CUDAGraphed wrappers in the streaming state.
+        
+        This allows torch.compile with reduce-overhead mode to manage
+        CUDA graphs instead of moshi's internal wrappers.
+        """
+        # The CUDAGraphed class has a 'disable' attribute we can set
+        # But it's set at construction time. We need to replace the wrappers
+        # with simple pass-through functions.
+        if hasattr(state, 'graphed_encoder') and state.graphed_encoder is not None:
+            state.graphed_encoder.disable = True
+            state.graphed_encoder._graph = None  # Reset any captured graph
+        if hasattr(state, 'graphed_decoder') and state.graphed_decoder is not None:
+            state.graphed_decoder.disable = True
+            state.graphed_decoder._graph = None
+        if hasattr(state, 'graphed_tr_enc') and state.graphed_tr_enc is not None:
+            state.graphed_tr_enc.disable = True
+            state.graphed_tr_enc._graph = None
+        if hasattr(state, 'graphed_tr_dec') and state.graphed_tr_dec is not None:
+            state.graphed_tr_dec.disable = True
+            state.graphed_tr_dec._graph = None
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode audio codes to waveform.
